@@ -1,11 +1,14 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::StatusCode;
+use tokio::time::{sleep, Duration};
 use tracing::debug;
 
 use crate::dt_types::{DtComponent, DtProject};
 
 const PAGE_SIZE: u32 = 100;
+const MAX_RETRIES: u32 = 3;
+const INITIAL_RETRY_DELAY_MS: u64 = 1000;
 
 #[async_trait]
 pub(crate) trait DtClient {
@@ -31,6 +34,74 @@ impl DtHttpClient {
     fn build_url(&self, path: &str) -> String {
         format!("{}/api{}", self.base_url, path)
     }
+
+    async fn fetch_with_retry<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<(T, usize)> {
+        let mut retry_count = 0;
+
+        loop {
+            let response = self
+                .http_client
+                .get(url)
+                .header("X-Api-Key", &self.api_key)
+                .send()
+                .await?;
+
+            match response.status() {
+                StatusCode::OK => {
+                    let total_count = response
+                        .headers()
+                        .get("X-Total-Count")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+
+                    let data: T = response.json().await?;
+                    return Ok((data, total_count));
+                }
+                StatusCode::TOO_MANY_REQUESTS => {
+                    if retry_count >= MAX_RETRIES {
+                        return Err(anyhow::format_err!(
+                            "DT API rate limit exceeded after {} retries",
+                            MAX_RETRIES
+                        ));
+                    }
+
+                    let retry_after = response
+                        .headers()
+                        .get("Retry-After")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(INITIAL_RETRY_DELAY_MS / 1000);
+
+                    let delay_ms = if retry_after > 0 {
+                        retry_after * 1000
+                    } else {
+                        INITIAL_RETRY_DELAY_MS * 2_u64.pow(retry_count)
+                    };
+
+                    debug!(
+                        "Rate limited (429), retrying in {}ms (attempt {}/{})",
+                        delay_ms,
+                        retry_count + 1,
+                        MAX_RETRIES
+                    );
+
+                    sleep(Duration::from_millis(delay_ms)).await;
+                    retry_count += 1;
+                }
+                _ => {
+                    return Err(anyhow::format_err!(
+                        "DT API error: status={}, body={}",
+                        response.status(),
+                        response.text().await?
+                    ));
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -47,29 +118,9 @@ impl DtClient for DtHttpClient {
 
             debug!("Fetching projects page {} from {}", page, url);
 
-            let response = self
-                .http_client
-                .get(&url)
-                .header("X-Api-Key", &self.api_key)
-                .send()
-                .await?;
+            let (projects, total_count): (Vec<DtProject>, usize) =
+                self.fetch_with_retry(&url).await?;
 
-            if response.status() != StatusCode::OK {
-                return Err(anyhow::format_err!(
-                    "DT API error: status={}, body={}",
-                    response.status(),
-                    response.text().await?
-                ));
-            }
-
-            let total_count = response
-                .headers()
-                .get("X-Total-Count")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-
-            let projects: Vec<DtProject> = response.json().await?;
             let fetched = projects.len();
             all_projects.extend(projects);
 
@@ -111,29 +162,9 @@ impl DtClient for DtHttpClient {
                 page, project_uuid
             );
 
-            let response = self
-                .http_client
-                .get(&url)
-                .header("X-Api-Key", &self.api_key)
-                .send()
-                .await?;
+            let (components, total_count): (Vec<DtComponent>, usize) =
+                self.fetch_with_retry(&url).await?;
 
-            if response.status() != StatusCode::OK {
-                return Err(anyhow::format_err!(
-                    "DT API error: status={}, body={}",
-                    response.status(),
-                    response.text().await?
-                ));
-            }
-
-            let total_count = response
-                .headers()
-                .get("X-Total-Count")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0);
-
-            let components: Vec<DtComponent> = response.json().await?;
             let fetched = components.len();
             all_components.extend(components);
 
@@ -269,5 +300,126 @@ mod tests {
         assert_eq!(components.len(), 1);
         assert_eq!(components[0].name, "lodash");
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_dt_client_handles_429_rate_limit() {
+        let mut server = mockito::Server::new_async().await;
+
+        let mock_fail = server
+            .mock("GET", "/api/v1/project")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("pageSize".into(), "100".into()),
+            ]))
+            .with_status(429)
+            .with_header("Retry-After", "0")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let mock_success = server
+            .mock("GET", "/api/v1/project")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("pageSize".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_header("X-Total-Count", "0")
+            .with_body("[]")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = DtHttpClient::new(server.url(), "test-key".to_string());
+        let result = client.get_projects().await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 0);
+        mock_fail.assert_async().await;
+        mock_success.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_dt_client_retry_exhaustion() {
+        let mut server = mockito::Server::new_async().await;
+
+        let mock = server
+            .mock("GET", "/api/v1/project")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("pageSize".into(), "100".into()),
+            ]))
+            .with_status(429)
+            .with_header("Retry-After", "0")
+            .expect(4) // Initial attempt + 3 retries
+            .create_async()
+            .await;
+
+        let client = DtHttpClient::new(server.url(), "test-key".to_string());
+        let result = client.get_projects().await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("rate limit") || err_msg.contains("429"),
+            "Error message was: {}",
+            err_msg
+        );
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_dt_client_handles_invalid_json() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/v1/project")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("pageSize".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_header("X-Total-Count", "1")
+            .with_body("not json at all")
+            .create_async()
+            .await;
+
+        let client = DtHttpClient::new(server.url(), "test-key".to_string());
+        let result = client.get_projects().await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("JSON")
+                || err_msg.contains("parse")
+                || err_msg.contains("expected")
+                || err_msg.contains("decoding"),
+            "Error message was: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dt_client_handles_missing_total_count() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/api/v1/project")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("pageSize".into(), "100".into()),
+            ]))
+            .with_status(200)
+            // No X-Total-Count header
+            .with_body(r#"[{"uuid":"123","name":"test-project","version":"1.0"}]"#)
+            .create_async()
+            .await;
+
+        let client = DtHttpClient::new(server.url(), "test-key".to_string());
+        let result = client.get_projects().await;
+
+        assert!(result.is_ok());
+        let projects = result.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "test-project");
     }
 }
