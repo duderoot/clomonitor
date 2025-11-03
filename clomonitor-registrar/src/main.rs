@@ -15,6 +15,9 @@ use tracing_subscriber::EnvFilter;
 use crate::db::PgDB;
 
 mod db;
+mod dt_client;
+mod dt_mapper;
+mod dt_types;
 mod registrar;
 
 #[derive(Debug, Parser)]

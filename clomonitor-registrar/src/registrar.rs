@@ -10,15 +10,33 @@ use tokio::time::{Instant, timeout};
 use tracing::{debug, error, info, instrument};
 
 use crate::db::DynDB;
+use crate::dt_client::{DtClient, DtHttpClient};
+use crate::dt_mapper::{convert_component_to_project, should_process_component};
 
 /// Maximum time that can take processing a foundation data file.
 const FOUNDATION_TIMEOUT: u64 = 300;
+
+/// Configuration for connecting to a Dependency-Track instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DtConfig {
+    pub dt_url: String,
+    pub dt_api_key: String,
+}
+
+/// Data source for a foundation - either a YAML URL or a Dependency-Track instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum DataSource {
+    YamlUrl { data_url: String },
+    DependencyTrack(DtConfig),
+}
 
 /// Represents a foundation registered in the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Foundation {
     pub foundation_id: String,
-    pub data_url: String,
+    #[serde(flatten)]
+    pub data_source: DataSource,
 }
 
 /// Represents a project to be registered or updated.
@@ -59,7 +77,7 @@ pub(crate) struct Project {
 }
 
 impl Project {
-    fn set_digest(&mut self) -> Result<()> {
+    pub(crate) fn set_digest(&mut self) -> Result<()> {
         let data = bincode::serde::encode_to_vec(&self, bincode::config::legacy())?;
         let digest = hex::encode(Sha256::digest(data));
         self.digest = Some(digest);
@@ -124,21 +142,37 @@ pub(crate) async fn run(cfg: &Config, db: DynDB) -> Result<()> {
     result
 }
 
-/// Process foundation's data file. New projects available will be registered
-/// in the database and existing ones which have changed will be updated. When
-/// a project is removed from the data file, it'll be removed from the database
-/// as well.
+/// Process foundation based on its data source type (YAML URL or Dependency-Track).
 #[instrument(fields(foundation = foundation.foundation_id), skip_all, err)]
 async fn process_foundation(
     db: DynDB,
     http_client: reqwest::Client,
     foundation: Foundation,
 ) -> Result<()> {
+    match foundation.data_source.clone() {
+        DataSource::YamlUrl { data_url } => {
+            process_yaml_foundation(db, http_client, foundation, &data_url).await
+        }
+        DataSource::DependencyTrack(_) => process_dt_foundation(db, foundation).await,
+    }
+}
+
+/// Process foundation's YAML data file. New projects available will be registered
+/// in the database and existing ones which have changed will be updated. When
+/// a project is removed from the data file, it'll be removed from the database
+/// as well.
+#[instrument(fields(foundation = foundation.foundation_id), skip_all, err)]
+async fn process_yaml_foundation(
+    db: DynDB,
+    http_client: reqwest::Client,
+    foundation: Foundation,
+    data_url: &str,
+) -> Result<()> {
     let start = Instant::now();
-    debug!("started");
+    debug!("started (YAML)");
 
     // Fetch foundation data file
-    let resp = http_client.get(foundation.data_url).send().await?;
+    let resp = http_client.get(data_url).send().await?;
     if resp.status() != StatusCode::OK {
         return Err(format_err!(
             "unexpected status code getting data file: {}",
@@ -170,10 +204,10 @@ async fn process_foundation(
     // Register or update available projects as needed
     for (name, project) in &projects_available {
         // Check if the project is already registered
-        if let Some(registered_digest) = projects_registered.get(name)
-            && registered_digest == &project.digest
-        {
-            continue;
+        if let Some(registered_digest) = projects_registered.get(name) {
+            if registered_digest == &project.digest {
+                continue;
+            }
         }
 
         // Register project
@@ -187,6 +221,104 @@ async fn process_foundation(
     if !projects_available.is_empty() {
         for name in projects_registered.keys() {
             if !projects_available.contains_key(name) {
+                debug!(project = name, "unregistering");
+                if let Err(err) = db.unregister_project(foundation_id, name).await {
+                    error!(?err, project = name, "error unregistering");
+                }
+            }
+        }
+    }
+
+    debug!(duration_secs = start.elapsed().as_secs(), "completed");
+    Ok(())
+}
+
+/// Process foundation's Dependency-Track instance. Fetches all projects and
+/// components from DT, converts them to CLOMonitor projects, and registers
+/// them in the database.
+#[instrument(fields(foundation = foundation.foundation_id), skip_all, err)]
+async fn process_dt_foundation(db: DynDB, foundation: Foundation) -> Result<()> {
+    let start = Instant::now();
+    debug!("started (Dependency-Track)");
+
+    let dt_config = match &foundation.data_source {
+        DataSource::DependencyTrack(config) => config,
+        _ => return Err(format_err!("Expected DependencyTrack data source")),
+    };
+
+    // Create DT client
+    let dt_client = DtHttpClient::new(dt_config.dt_url.clone(), dt_config.dt_api_key.clone());
+
+    // Fetch all projects from DT
+    let dt_projects = dt_client.get_projects().await?;
+    debug!("Found {} DT projects", dt_projects.len());
+
+    // Collect all components from all projects and convert to CLOMonitor projects
+    let mut all_projects_to_register = HashMap::new();
+
+    for dt_project in dt_projects {
+        debug!(
+            "Processing DT project: {} ({})",
+            dt_project.name, dt_project.uuid
+        );
+
+        let components = dt_client.get_project_components(&dt_project.uuid).await?;
+        debug!(
+            "Found {} components in project {}",
+            components.len(),
+            dt_project.name
+        );
+
+        for component in components {
+            // Filter components
+            if !should_process_component(&component) {
+                debug!(
+                    "Skipping component {} with classifier {}",
+                    component.name, component.classifier
+                );
+                continue;
+            }
+
+            // Convert to CLOMonitor project
+            match convert_component_to_project(&component, &dt_project.name) {
+                Ok(project) => {
+                    all_projects_to_register.insert(project.name.clone(), project);
+                }
+                Err(e) => {
+                    debug!("Skipping component {}: {}", component.name, e);
+                }
+            }
+        }
+    }
+
+    debug!(
+        "Total projects to register: {}",
+        all_projects_to_register.len()
+    );
+
+    // Get currently registered projects
+    let foundation_id = &foundation.foundation_id;
+    let projects_registered = db.foundation_projects(foundation_id).await?;
+
+    // Register or update projects
+    for (name, project) in &all_projects_to_register {
+        // Check if the project is already registered
+        if let Some(registered_digest) = projects_registered.get(name) {
+            if registered_digest == &project.digest {
+                continue;
+            }
+        }
+
+        debug!(project = project.name, "registering");
+        if let Err(err) = db.register_project(foundation_id, project).await {
+            error!(?err, project = project.name, "error registering");
+        }
+    }
+
+    // Unregister projects no longer in DT
+    if !all_projects_to_register.is_empty() {
+        for name in projects_registered.keys() {
+            if !all_projects_to_register.contains_key(name) {
                 debug!(project = name, "unregistering");
                 if let Err(err) = db.unregister_project(foundation_id, name).await {
                     error!(?err, project = name, "error unregistering");
@@ -249,7 +381,9 @@ mod tests {
         db.expect_foundations().times(1).returning(move || {
             Box::pin(future::ready(Ok(vec![Foundation {
                 foundation_id: FOUNDATION.to_string(),
-                data_url: url.clone(),
+                data_source: DataSource::YamlUrl {
+                    data_url: url.clone(),
+                },
             }])))
         });
 
@@ -278,7 +412,9 @@ mod tests {
         db.expect_foundations().times(1).returning(move || {
             Box::pin(future::ready(Ok(vec![Foundation {
                 foundation_id: FOUNDATION.to_string(),
-                data_url: url.clone(),
+                data_source: DataSource::YamlUrl {
+                    data_url: url.clone(),
+                },
             }])))
         });
 
@@ -308,7 +444,9 @@ mod tests {
         db.expect_foundations().times(1).returning(move || {
             Box::pin(future::ready(Ok(vec![Foundation {
                 foundation_id: FOUNDATION.to_string(),
-                data_url: url.clone(),
+                data_source: DataSource::YamlUrl {
+                    data_url: url.clone(),
+                },
             }])))
         });
         db.expect_foundation_projects()
@@ -339,7 +477,9 @@ mod tests {
         db.expect_foundations().times(1).returning(move || {
             Box::pin(future::ready(Ok(vec![Foundation {
                 foundation_id: FOUNDATION.to_string(),
-                data_url: url.clone(),
+                data_source: DataSource::YamlUrl {
+                    data_url: url.clone(),
+                },
             }])))
         });
         db.expect_foundation_projects()
@@ -379,7 +519,9 @@ mod tests {
         db.expect_foundations().times(1).returning(move || {
             Box::pin(future::ready(Ok(vec![Foundation {
                 foundation_id: FOUNDATION.to_string(),
-                data_url: url.clone(),
+                data_source: DataSource::YamlUrl {
+                    data_url: url.clone(),
+                },
             }])))
         });
         db.expect_foundation_projects()
@@ -434,7 +576,9 @@ mod tests {
         db.expect_foundations().times(1).returning(move || {
             Box::pin(future::ready(Ok(vec![Foundation {
                 foundation_id: FOUNDATION.to_string(),
-                data_url: url.clone(),
+                data_source: DataSource::YamlUrl {
+                    data_url: url.clone(),
+                },
             }])))
         });
         db.expect_foundation_projects()
@@ -474,5 +618,122 @@ mod tests {
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_dt_config_deserialization() {
+        let yaml = r#"
+            dt_url: "https://dtrack.example.com"
+            dt_api_key: "secret123"
+        "#;
+        let config: DtConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.dt_url, "https://dtrack.example.com");
+        assert_eq!(config.dt_api_key, "secret123");
+    }
+
+    #[test]
+    fn test_foundation_yaml_url_deserialization() {
+        let json = r#"{
+            "foundation_id": "cncf",
+            "data_url": "https://example.com/data.yaml"
+        }"#;
+        let foundation: Foundation = serde_json::from_str(json).unwrap();
+        assert_eq!(foundation.foundation_id, "cncf");
+        assert!(matches!(foundation.data_source, DataSource::YamlUrl { .. }));
+        if let DataSource::YamlUrl { data_url } = foundation.data_source {
+            assert_eq!(data_url, "https://example.com/data.yaml");
+        }
+    }
+
+    #[test]
+    fn test_foundation_dt_deserialization() {
+        let json = r#"{
+            "foundation_id": "dt-instance",
+            "dt_url": "https://dtrack.example.com",
+            "dt_api_key": "secret"
+        }"#;
+        let foundation: Foundation = serde_json::from_str(json).unwrap();
+        assert_eq!(foundation.foundation_id, "dt-instance");
+        assert!(matches!(
+            foundation.data_source,
+            DataSource::DependencyTrack(_)
+        ));
+        if let DataSource::DependencyTrack(dt_config) = foundation.data_source {
+            assert_eq!(dt_config.dt_url, "https://dtrack.example.com");
+            assert_eq!(dt_config.dt_api_key, "secret");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_process_dt_foundation() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Mock projects endpoint
+        let projects_mock = server
+            .mock("GET", "/api/v1/project")
+            .match_header("X-Api-Key", "test-key")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("pageSize".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_header("X-Total-Count", "1")
+            .with_body(
+                r#"[{"uuid":"proj-1","name":"my-app","description":"Test app","version":"1.0"}]"#,
+            )
+            .create_async()
+            .await;
+
+        // Mock components endpoint
+        let components_mock = server
+            .mock("GET", "/api/v1/component/project/proj-1")
+            .match_header("X-Api-Key", "test-key")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),
+                mockito::Matcher::UrlEncoded("pageSize".into(), "100".into()),
+            ]))
+            .with_status(200)
+            .with_header("X-Total-Count", "1")
+            .with_body(
+                r#"[{
+                    "uuid":"comp-1",
+                    "name":"lodash",
+                    "version":"4.17.21",
+                    "group":"npm",
+                    "classifier":"LIBRARY",
+                    "description":"Lodash library",
+                    "externalReferences":[{"type":"vcs","url":"https://github.com/lodash/lodash"}]
+                }]"#,
+            )
+            .create_async()
+            .await;
+
+        let mut db = MockDB::new();
+        db.expect_foundation_projects()
+            .with(eq("dt-test"))
+            .times(1)
+            .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
+
+        db.expect_register_project()
+            .with(eq("dt-test"), mockall::predicate::function(|p: &Project| {
+                p.name == "npm-lodash-4.17.21"
+            }))
+            .times(1)
+            .returning(|_, _| Box::pin(future::ready(Ok(()))));
+
+        let foundation = Foundation {
+            foundation_id: "dt-test".to_string(),
+            data_source: DataSource::DependencyTrack(DtConfig {
+                dt_url: server.url(),
+                dt_api_key: "test-key".to_string(),
+            }),
+        };
+
+        process_dt_foundation(Arc::new(db), foundation)
+            .await
+            .unwrap();
+
+        projects_mock.assert_async().await;
+        components_mock.assert_async().await;
     }
 }
