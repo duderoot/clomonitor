@@ -1,0 +1,9 @@
+{
+  "info": {
+    "name": "homepage-only",
+    "version": "1.5.0",
+    "summary": "Package with only homepage as GitHub URL",
+    "home_page": "https://github.com/user/homepage-only",
+    "license": "BSD"
+  }
+}

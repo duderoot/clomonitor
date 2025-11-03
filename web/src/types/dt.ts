@@ -36,3 +36,15 @@ export interface UnmappedComponentsResponse {
   components: UnmappedComponent[];
   total_count: number;
 }
+
+export interface ComponentMapping {
+  id: number;
+  foundation_id: string;
+  component_identifier: string;
+  repository_url: string;
+  mapping_type: 'manual' | 'automatic' | 'suggested';
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  notes?: string;
+}

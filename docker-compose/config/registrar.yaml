@@ -1,0 +1,15 @@
+db:
+  host: clomonitor-db
+  port: "5432"
+  dbname: clomonitor
+  user: clomonitor
+  password: clomonitor
+registrar:
+  concurrency: 1
+
+# Phase 3: Registry API Integration
+registry_apis:
+  enabled: true           # Enable registry API lookups
+  npm_enabled: true       # Enable npm registry
+  maven_enabled: true     # Enable Maven Central
+  pypi_enabled: true      # Enable PyPI

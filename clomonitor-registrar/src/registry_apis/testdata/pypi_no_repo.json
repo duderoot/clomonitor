@@ -1,0 +1,9 @@
+{
+  "info": {
+    "name": "no-repo-package",
+    "version": "1.0.0",
+    "summary": "Package without repository info",
+    "home_page": "https://example.com/docs",
+    "license": "MIT"
+  }
+}

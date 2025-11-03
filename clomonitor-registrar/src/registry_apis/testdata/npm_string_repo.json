@@ -1,0 +1,7 @@
+{
+  "name": "string-repo",
+  "version": "1.0.0",
+  "description": "Package with repository as string",
+  "repository": "github:user/repo",
+  "license": "MIT"
+}

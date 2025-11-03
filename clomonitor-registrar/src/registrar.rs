@@ -12,6 +12,7 @@ use tracing::{debug, error, info, instrument};
 use crate::db::DynDB;
 use crate::dt_client::{DtClient, DtHttpClient};
 use crate::dt_mapper::{extract_repository_url_with_lookup, should_process_component};
+use crate::registry_apis::{RegistryRouter, NpmRegistry, maven::MavenRegistry, pypi::PyPIRegistry};
 
 /// Maximum time that can take processing a foundation data file.
 const FOUNDATION_TIMEOUT: u64 = 300;
@@ -21,6 +22,20 @@ const FOUNDATION_TIMEOUT: u64 = 300;
 pub(crate) struct DtConfig {
     pub dt_url: String,
     pub dt_api_key: String,
+}
+
+/// Configuration for registry API lookups.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(crate) struct RegistryApiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub npm_enabled: bool,
+    #[serde(default)]
+    pub maven_enabled: bool,
+    #[serde(default)]
+    pub pypi_enabled: bool,
 }
 
 /// Data source for a foundation - either a YAML URL or a Dependency-Track instance.
@@ -126,6 +141,12 @@ pub(crate) enum RepositoryLookupResult {
 pub(crate) async fn run(cfg: &Config, db: DynDB) -> Result<()> {
     info!("started");
 
+    // Read registry API configuration
+    let registry_api_cfg = cfg
+        .get::<RegistryApiConfig>("registry_apis")
+        .unwrap_or_default();
+    debug!("Registry API config: {:?}", registry_api_cfg);
+
     // Process foundations
     let http_client = reqwest::Client::new();
     let foundations = db.foundations().await?;
@@ -135,7 +156,7 @@ pub(crate) async fn run(cfg: &Config, db: DynDB) -> Result<()> {
             let foundation_id = foundation.foundation_id.clone();
             match timeout(
                 Duration::from_secs(FOUNDATION_TIMEOUT),
-                process_foundation(db.clone(), http_client.clone(), foundation),
+                process_foundation(db.clone(), http_client.clone(), foundation, registry_api_cfg.clone()),
             )
             .await
             {
@@ -171,12 +192,15 @@ async fn process_foundation(
     db: DynDB,
     http_client: reqwest::Client,
     foundation: Foundation,
+    registry_api_cfg: RegistryApiConfig,
 ) -> Result<()> {
     match foundation.data_source.clone() {
         DataSource::YamlUrl { data_url } => {
             process_yaml_foundation(db, http_client, foundation, &data_url).await
         }
-        DataSource::DependencyTrack(_) => process_dt_foundation(db, foundation).await,
+        DataSource::DependencyTrack(_) => {
+            process_dt_foundation(db, foundation, registry_api_cfg).await
+        }
     }
 }
 
@@ -260,13 +284,48 @@ async fn process_yaml_foundation(
 /// components from DT, converts them to CLOMonitor projects, and registers
 /// them in the database.
 #[instrument(fields(foundation = foundation.foundation_id), skip_all, err)]
-async fn process_dt_foundation(db: DynDB, foundation: Foundation) -> Result<()> {
+async fn process_dt_foundation(
+    db: DynDB,
+    foundation: Foundation,
+    registry_api_cfg: RegistryApiConfig,
+) -> Result<()> {
     let start = Instant::now();
     debug!("started (Dependency-Track)");
 
     let dt_config = match &foundation.data_source {
         DataSource::DependencyTrack(config) => config,
         _ => return Err(format_err!("Expected DependencyTrack data source")),
+    };
+
+    // Create registry API router if enabled
+    let registry_router = if registry_api_cfg.enabled {
+        use std::sync::Arc;
+
+        let npm = if registry_api_cfg.npm_enabled {
+            info!("Registry API: npm enabled");
+            Some(Arc::new(NpmRegistry::new()) as Arc<dyn crate::registry_apis::RegistryApi>)
+        } else {
+            None
+        };
+
+        let maven = if registry_api_cfg.maven_enabled {
+            info!("Registry API: Maven enabled");
+            Some(Arc::new(MavenRegistry::new()) as Arc<dyn crate::registry_apis::RegistryApi>)
+        } else {
+            None
+        };
+
+        let pypi = if registry_api_cfg.pypi_enabled {
+            info!("Registry API: PyPI enabled");
+            Some(Arc::new(PyPIRegistry::new()) as Arc<dyn crate::registry_apis::RegistryApi>)
+        } else {
+            None
+        };
+
+        Some(std::sync::Arc::new(RegistryRouter::new(npm, maven, pypi)))
+    } else {
+        info!("Registry API: disabled");
+        None
     };
 
     // Create DT client
@@ -305,8 +364,8 @@ async fn process_dt_foundation(db: DynDB, foundation: Foundation) -> Result<()> 
                 continue;
             }
 
-            // Try to find repository URL with DB lookup
-            match extract_repository_url_with_lookup(&component, &db).await {
+            // Try to find repository URL with DB lookup and optional registry APIs
+            match extract_repository_url_with_lookup(&component, &db, registry_router.as_ref()).await {
                 RepositoryLookupResult::Found(repo_url) => {
                     // Create CLOMonitor project with the found repository URL
                     match build_project_from_component(&component, &dt_project.name, repo_url) {
@@ -863,7 +922,7 @@ mod tests {
             }),
         };
 
-        process_dt_foundation(Arc::new(db), foundation)
+        process_dt_foundation(Arc::new(db), foundation, RegistryApiConfig::default())
             .await
             .unwrap();
 
@@ -904,7 +963,7 @@ mod tests {
         };
 
         // Should succeed without errors
-        process_dt_foundation(Arc::new(db), foundation)
+        process_dt_foundation(Arc::new(db), foundation, RegistryApiConfig::default())
             .await
             .unwrap();
 
@@ -959,7 +1018,7 @@ mod tests {
         };
 
         // Should succeed without errors
-        process_dt_foundation(Arc::new(db), foundation)
+        process_dt_foundation(Arc::new(db), foundation, RegistryApiConfig::default())
             .await
             .unwrap();
 
@@ -1037,7 +1096,7 @@ mod tests {
         };
 
         // Should succeed, just skips the component
-        process_dt_foundation(Arc::new(db), foundation)
+        process_dt_foundation(Arc::new(db), foundation, RegistryApiConfig::default())
             .await
             .unwrap();
 
@@ -1111,7 +1170,7 @@ mod tests {
         };
 
         // Should succeed, just skips CONTAINER and APPLICATION components
-        process_dt_foundation(Arc::new(db), foundation)
+        process_dt_foundation(Arc::new(db), foundation, RegistryApiConfig::default())
             .await
             .unwrap();
 

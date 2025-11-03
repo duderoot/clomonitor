@@ -6,6 +6,6 @@ db:
   password: clomonitor
 creds:
   githubTokens:
-    - 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
+    - github_pat_11ABFZPJY0Fhq2jK3fikez_lVimQs2qZfwgu4d1d0BIeMYuoDQt0iccmRC2Spnp343FNSJYKFUugEbP
 tracker:
   concurrency: 10

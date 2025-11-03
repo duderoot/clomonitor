@@ -1,16 +1,24 @@
 use anyhow::{format_err, Result};
+use std::sync::Arc;
+
 use crate::db::DynDB;
 use crate::dt_types::DtComponent;
 use crate::registrar::{Project, Repository, UnmappedComponent, RepositoryLookupResult};
+use crate::registry_apis::RegistryRouter;
 
 #[cfg(test)]
 use crate::dt_types::ExternalReference;
 
-/// Extract repository URL from DT component with database lookup.
-/// This function first checks the component mapping table, then falls back to auto-discovery.
+/// Extract repository URL from DT component with database lookup and optional registry API fallback.
+/// Priority order:
+/// 1. Database component mapping table
+/// 2. Auto-discovery (VCS refs, GitHub/GitLab PURLs)
+/// 3. Registry API lookup (npm, Maven Central, PyPI)
+/// 4. Return unmapped component
 pub(crate) async fn extract_repository_url_with_lookup(
     component: &DtComponent,
     db: &DynDB,
+    registry_router: Option<&Arc<RegistryRouter>>,
 ) -> RepositoryLookupResult {
     // Priority 1: Check mapping table if purl exists
     if let Some(purl) = &component.purl {
@@ -28,7 +36,16 @@ pub(crate) async fn extract_repository_url_with_lookup(
         return RepositoryLookupResult::Found(repo_url);
     }
 
-    // Priority 3: No mapping found, create unmapped component
+    // Priority 3: Try registry API lookup if available and component has purl
+    if let (Some(router), Some(purl)) = (registry_router, &component.purl) {
+        if let Ok(Some(repo_url)) = router.lookup(purl).await {
+            // Save to mapping table with 'registry_api' source
+            let _ = db.save_component_mapping(purl, &repo_url, "registry_api", Some(70)).await;
+            return RepositoryLookupResult::Found(repo_url);
+        }
+    }
+
+    // Priority 4: No mapping found, create unmapped component
     let unmapped = UnmappedComponent {
         component_uuid: component.uuid.clone(),
         component_name: component.name.clone(),
@@ -523,7 +540,7 @@ mod tests {
         let db: crate::db::DynDB = Arc::new(mock_db);
 
         // Execute
-        let result = extract_repository_url_with_lookup(&component, &db).await;
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
 
         // Assert: Should return Found with DB URL
         match result {
@@ -579,7 +596,7 @@ mod tests {
         let db: crate::db::DynDB = Arc::new(mock_db);
 
         // Execute
-        let result = extract_repository_url_with_lookup(&component, &db).await;
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
 
         // Assert: Should return Found with auto-discovered URL and save to DB
         match result {
@@ -620,7 +637,7 @@ mod tests {
         let db: crate::db::DynDB = Arc::new(mock_db);
 
         // Execute
-        let result = extract_repository_url_with_lookup(&component, &db).await;
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
 
         // Assert: Should return NotFound with UnmappedComponent
         match result {
@@ -687,7 +704,7 @@ mod tests {
         let db: crate::db::DynDB = Arc::new(mock_db);
 
         // Execute
-        let result = extract_repository_url_with_lookup(&component, &db).await;
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
 
         // Assert: Should return DB URL, NOT the auto-discovered URL
         match result {
@@ -734,7 +751,7 @@ mod tests {
         let db: crate::db::DynDB = Arc::new(mock_db);
 
         // Execute
-        let result = extract_repository_url_with_lookup(&component, &db).await;
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
 
         // Assert: Should return Found with auto-discovered URL
         match result {
@@ -789,7 +806,7 @@ mod tests {
         let db: crate::db::DynDB = Arc::new(mock_db);
 
         // Execute
-        let result = extract_repository_url_with_lookup(&component, &db).await;
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
 
         // Assert: Should fall back to auto-discovery when DB errors
         match result {
@@ -842,7 +859,7 @@ mod tests {
         let db: crate::db::DynDB = Arc::new(mock_db);
 
         // Execute
-        let result = extract_repository_url_with_lookup(&component, &db).await;
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
 
         // Assert: Should auto-discover from purl and save to DB
         match result {
@@ -851,5 +868,243 @@ mod tests {
             }
             _ => panic!("Expected Found result from purl auto-discovery, got NotFound"),
         }
+    }
+
+    // Phase 3.4 Tests - Registry API Integration
+
+    #[tokio::test]
+    async fn test_registry_lookup_after_auto_discovery_fails() {
+        use crate::db::MockDB;
+        use crate::registry_apis::{RegistryRouter, npm::NpmRegistry};
+        use mockito;
+        use std::sync::Arc;
+
+        // Setup mock npm server
+        let mut npm_mock = mockito::Server::new_async().await;
+        let npm_server = npm_mock
+            .mock("GET", "/lodash")
+            .with_status(200)
+            .with_body(r#"{"repository": {"url": "https://github.com/lodash/lodash.git"}}"#)
+            .create_async()
+            .await;
+
+        // Create registry router with npm
+        let npm_registry = Arc::new(NpmRegistry::new_with_base_url(npm_mock.url()));
+        let router = Arc::new(RegistryRouter::new(Some(npm_registry), None, None));
+
+        // Component with npm purl, no VCS reference, no DB mapping
+        let component = DtComponent {
+            uuid: "comp-uuid-8".to_string(),
+            name: "lodash".to_string(),
+            version: Some("4.17.21".to_string()),
+            group: None,
+            purl: Some("pkg:npm/lodash@4.17.21".to_string()),
+            description: None,
+            classifier: "LIBRARY".to_string(),
+            external_references: None, // No VCS ref - auto-discovery fails
+        };
+
+        // Mock DB
+        let mut mock_db = MockDB::new();
+        mock_db
+            .expect_get_component_mapping()
+            .returning(|_| Box::pin(async { Ok(None) }));
+        mock_db
+            .expect_save_component_mapping()
+            .with(
+                mockall::predicate::eq("pkg:npm/lodash@4.17.21"),
+                mockall::predicate::eq("https://github.com/lodash/lodash"),
+                mockall::predicate::eq("registry_api"),
+                mockall::predicate::eq(Some(70)),
+            )
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
+        let db: crate::db::DynDB = Arc::new(mock_db);
+
+        // Execute
+        let result = extract_repository_url_with_lookup(&component, &db, Some(&router)).await;
+
+        // Assert
+        match result {
+            RepositoryLookupResult::Found(url) => {
+                assert_eq!(url, "https://github.com/lodash/lodash");
+            }
+            _ => panic!("Expected Found from registry API, got NotFound"),
+        }
+
+        npm_server.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_registry_lookup_skipped_when_router_none() {
+        use crate::db::MockDB;
+        use std::sync::Arc;
+
+        // Component with npm purl, no VCS reference
+        let component = DtComponent {
+            uuid: "comp-uuid-9".to_string(),
+            name: "express".to_string(),
+            version: Some("4.18.2".to_string()),
+            group: None,
+            purl: Some("pkg:npm/express@4.18.2".to_string()),
+            description: None,
+            classifier: "LIBRARY".to_string(),
+            external_references: None,
+        };
+
+        // Mock DB with no mapping
+        let mut mock_db = MockDB::new();
+        mock_db
+            .expect_get_component_mapping()
+            .returning(|_| Box::pin(async { Ok(None) }));
+        // save_component_mapping should NOT be called (no registry lookup)
+        mock_db.expect_save_component_mapping().times(0);
+
+        let db: crate::db::DynDB = Arc::new(mock_db);
+
+        // Execute with None router
+        let result = extract_repository_url_with_lookup(&component, &db, None).await;
+
+        // Assert: Should return NotFound (registry lookup skipped)
+        match result {
+            RepositoryLookupResult::NotFound(unmapped) => {
+                assert_eq!(unmapped.component_name, "express");
+            }
+            _ => panic!("Expected NotFound when router is None, got Found"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_registry_lookup_respects_priority_order() {
+        use crate::db::MockDB;
+        use crate::registry_apis::{RegistryRouter, npm::NpmRegistry};
+        use mockito;
+        use std::sync::Arc;
+
+        // Setup mock npm server
+        let mut npm_mock = mockito::Server::new_async().await;
+        // Mock should NOT be called because auto-discovery succeeds first
+        let npm_server = npm_mock
+            .mock("GET", "/axios")
+            .expect(0) // Should not be called
+            .create_async()
+            .await;
+
+        let npm_registry = Arc::new(NpmRegistry::new_with_base_url(npm_mock.url()));
+        let router = Arc::new(RegistryRouter::new(Some(npm_registry), None, None));
+
+        // Component with BOTH npm purl AND VCS reference
+        // Auto-discovery should win (priority 2 before registry lookup priority 3)
+        let component = DtComponent {
+            uuid: "comp-uuid-10".to_string(),
+            name: "axios".to_string(),
+            version: Some("1.4.0".to_string()),
+            group: None,
+            purl: Some("pkg:npm/axios@1.4.0".to_string()),
+            description: None,
+            classifier: "LIBRARY".to_string(),
+            external_references: Some(vec![ExternalReference {
+                type_: "vcs".to_string(),
+                url: "https://github.com/axios/axios".to_string(),
+            }]),
+        };
+
+        // Mock DB with no mapping
+        let mut mock_db = MockDB::new();
+        mock_db
+            .expect_get_component_mapping()
+            .returning(|_| Box::pin(async { Ok(None) }));
+        // Should save with 'auto' source, not 'registry_api'
+        mock_db
+            .expect_save_component_mapping()
+            .with(
+                mockall::predicate::eq("pkg:npm/axios@1.4.0"),
+                mockall::predicate::eq("https://github.com/axios/axios"),
+                mockall::predicate::eq("auto"),
+                mockall::predicate::eq(Some(80)),
+            )
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
+        let db: crate::db::DynDB = Arc::new(mock_db);
+
+        // Execute
+        let result = extract_repository_url_with_lookup(&component, &db, Some(&router)).await;
+
+        // Assert: Auto-discovery wins (registry not called)
+        match result {
+            RepositoryLookupResult::Found(url) => {
+                assert_eq!(url, "https://github.com/axios/axios");
+            }
+            _ => panic!("Expected Found from auto-discovery, got NotFound"),
+        }
+
+        npm_server.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_registry_lookup_maven_component() {
+        use crate::db::MockDB;
+        use crate::registry_apis::{RegistryRouter, maven::MavenRegistry};
+        use mockito;
+        use std::sync::Arc;
+
+        // Setup mock Maven server
+        let mut maven_mock = mockito::Server::new_async().await;
+        let pom_xml = r#"<?xml version="1.0"?>
+<project><scm><url>https://github.com/spring-projects/spring-framework</url></scm></project>"#;
+        let maven_server = maven_mock
+            .mock("GET", "/org/springframework/spring-core/5.3.0/spring-core-5.3.0.pom")
+            .with_status(200)
+            .with_body(pom_xml)
+            .create_async()
+            .await;
+
+        let maven_registry = Arc::new(MavenRegistry::new_with_base_url(maven_mock.url()));
+        let router = Arc::new(RegistryRouter::new(None, Some(maven_registry), None));
+
+        // Maven component without VCS reference
+        let component = DtComponent {
+            uuid: "comp-uuid-11".to_string(),
+            name: "spring-core".to_string(),
+            version: Some("5.3.0".to_string()),
+            group: Some("org.springframework".to_string()),
+            purl: Some("pkg:maven/org.springframework/spring-core@5.3.0".to_string()),
+            description: None,
+            classifier: "LIBRARY".to_string(),
+            external_references: None,
+        };
+
+        // Mock DB
+        let mut mock_db = MockDB::new();
+        mock_db
+            .expect_get_component_mapping()
+            .returning(|_| Box::pin(async { Ok(None) }));
+        mock_db
+            .expect_save_component_mapping()
+            .with(
+                mockall::predicate::eq("pkg:maven/org.springframework/spring-core@5.3.0"),
+                mockall::predicate::eq("https://github.com/spring-projects/spring-framework"),
+                mockall::predicate::eq("registry_api"),
+                mockall::predicate::eq(Some(70)),
+            )
+            .times(1)
+            .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
+        let db: crate::db::DynDB = Arc::new(mock_db);
+
+        // Execute
+        let result = extract_repository_url_with_lookup(&component, &db, Some(&router)).await;
+
+        // Assert
+        match result {
+            RepositoryLookupResult::Found(url) => {
+                assert_eq!(url, "https://github.com/spring-projects/spring-framework");
+            }
+            _ => panic!("Expected Found from Maven registry API, got NotFound"),
+        }
+
+        maven_server.assert_async().await;
     }
 }

@@ -37,7 +37,7 @@ const DTView = () => {
   };
 
   return (
-    <div className="d-flex flex-column flex-grow-1 position-relative">
+    <div className="d-flex flex-column flex-grow-1 position-relative" data-testid="dt-dashboard">
       <SubNavbar>
         <div className="d-flex flex-column flex-sm-row align-items-center w-100 justify-content-between my-2">
           <div className="d-flex flex-column">

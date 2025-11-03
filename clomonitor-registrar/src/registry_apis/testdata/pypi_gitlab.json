@@ -1,0 +1,12 @@
+{
+  "info": {
+    "name": "gitlab-package",
+    "version": "3.0.0",
+    "summary": "Package hosted on GitLab",
+    "project_urls": {
+      "Homepage": "https://gitlab.com/gitlab-org/python-gitlab",
+      "Source": "https://gitlab.com/gitlab-org/python-gitlab"
+    },
+    "license": "LGPL"
+  }
+}

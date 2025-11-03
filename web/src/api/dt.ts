@@ -1,4 +1,4 @@
-import { ImportStats, UnmappedComponent } from '../types/dt';
+import { ImportStats, UnmappedComponent, ComponentMapping } from '../types/dt';
 
 interface FetchOptions {
   method: 'POST' | 'GET' | 'PUT' | 'DELETE' | 'HEAD';
@@ -112,6 +112,83 @@ class DT_API_CLASS {
         headers: {
           'Content-Type': 'application/json',
         },
+      },
+    });
+  }
+
+  // Phase 2: CRUD operations for component mappings
+  public async createComponentMapping(data: {
+    foundation_id: string;
+    component_identifier: string;
+    repository_url: string;
+    mapping_type: 'manual' | 'automatic' | 'suggested';
+    created_by: string;
+    notes?: string;
+  }): Promise<ComponentMapping> {
+    const url = `${this.API_BASE_URL}/mappings`;
+    return this.apiFetch({
+      url,
+      opts: {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data),
+      },
+    });
+  }
+
+  public async updateComponentMapping(
+    purl: string,
+    data: {
+      repository_url?: string;
+      mapping_type?: 'manual' | 'automatic' | 'suggested';
+      notes?: string;
+    }
+  ): Promise<ComponentMapping> {
+    const url = `${this.API_BASE_URL}/mappings/${encodeURIComponent(purl)}`;
+    return this.apiFetch({
+      url,
+      opts: {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data),
+      },
+    });
+  }
+
+  public async deleteComponentMapping(purl: string): Promise<void> {
+    const url = `${this.API_BASE_URL}/mappings/${encodeURIComponent(purl)}`;
+    return this.apiFetch({
+      url,
+      opts: {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    });
+  }
+
+  public async ignoreComponent(
+    componentId: number,
+    data: {
+      ignored: boolean;
+      ignored_by: string;
+      notes?: string;
+    }
+  ): Promise<UnmappedComponent> {
+    const url = `${this.API_BASE_URL}/unmapped/${componentId}/ignore`;
+    return this.apiFetch({
+      url,
+      opts: {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data),
       },
     });
   }

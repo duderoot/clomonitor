@@ -1,0 +1,6 @@
+{
+  "name": "no-repo-package",
+  "version": "1.0.0",
+  "description": "Package without repository field",
+  "license": "MIT"
+}
