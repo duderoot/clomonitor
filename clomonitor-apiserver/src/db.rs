@@ -79,6 +79,12 @@ pub(crate) trait DB {
 
     /// Update the number of views of the projects provided.
     async fn update_projects_views(&self, data: Vec<(ProjectId, Day, Total)>) -> Result<()>;
+
+    /// Get unmapped DT components.
+    async fn get_unmapped_components(&self, input: &serde_json::Value) -> Result<serde_json::Value>;
+
+    /// Get unmapped DT components statistics.
+    async fn get_unmapped_stats(&self, input: &serde_json::Value) -> Result<serde_json::Value>;
 }
 
 /// DB implementation backed by PostgreSQL.
@@ -256,6 +262,22 @@ impl DB for PgDB {
         )
         .await?;
         Ok(())
+    }
+
+    async fn get_unmapped_components(&self, input: &serde_json::Value) -> Result<serde_json::Value> {
+        let db = self.pool.get().await?;
+        let row = db
+            .query_one("select get_unmapped_components($1::jsonb)", &[input])
+            .await?;
+        Ok(row.get(0))
+    }
+
+    async fn get_unmapped_stats(&self, input: &serde_json::Value) -> Result<serde_json::Value> {
+        let db = self.pool.get().await?;
+        let row = db
+            .query_one("select get_unmapped_stats($1::jsonb)", &[input])
+            .await?;
+        Ok(row.get(0))
     }
 }
 

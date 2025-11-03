@@ -22,7 +22,8 @@
   },
   "devDependencies": {
     "@babel/plugin-proposal-private-property-in-object": "^7.21.11",
-    "@eslint/js": "^9.38.0",
+    "@eslint/js": "^9.36.0",
+    "@playwright/test": "^1.48.0",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.0",
@@ -50,11 +51,25 @@
     "prettier": "^3.6.2",
     "sass": "^1.93.2",
     "shx": "^0.4.0",
-    "source-map-explorer": "^2.5.3",
-    "typescript": "^5.9.3",
-    "typescript-eslint": "^8.46.2",
-    "vite": "^7.1.12",
-    "vitest": "^4.0.4"
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.2",
+    "typescript-eslint": "^8.44.1"
+  },
+  "resolutions": {
+    "@types/react-syntax-highlighter/**/@types/react": "18.3.18",
+    "@types/react-router-dom/**/@types/react": "18.3.18",
+    "@types/react-router-dom/**/@types/react-dom": "18.3.5",
+    "react-scripts/**/core-js-pure": "3.41.0",
+    "react-scripts/**/nth-check": "^2.0.1",
+    "clo-ui/**/rimraf": "^3.0.2"
+  },
+  "proxy": "http://127.0.0.1:8000",
+  "jest": {
+    "moduleNameMapper": {
+      "\\.(jpg|ico|jpeg|png|gif|eot|otf|webp|svg|ttf|woff|woff2|mp4|webm|wav|mp3|m4a|aac|oga)$": "<rootDir>/__mocks__/fileMock.js",
+      "\\.(css|less)$": "<rootDir>/__mocks__/fileMock.js"
+    }
   },
   "scripts": {
     "copy:static": "shx rm -rf src/static && shx mkdir src/static && shx cp -r public/static/* src",
@@ -67,12 +82,14 @@
     "isready": "yarn format && yarn lint && yarn test --passWithNoTests && yarn build",
     "lint": "eslint src --max-warnings 0",
     "lint:fix": "eslint src --max-warnings 0 --fix",
-    "start": "yarn copy:static && vite --host",
-    "test": "vitest run --passWithNoTests",
-    "test:coverage": "vitest run --passWithNoTests --coverage"
-  },
-  "resolutions": {
-    "react-date-range/date-fns": "2.30.0"
+    "start": "yarn copy:static && DANGEROUSLY_DISABLE_HOST_CHECK=true DISABLE_ESLINT_PLUGIN=true react-scripts start",
+    "test": "sed -i -e 's/const FORCE_EXIT_DELAY = 500;/const FORCE_EXIT_DELAY = 1000;/g' ./node_modules/jest-worker/build/base/BaseWorkerPool.js && TZ=UTC react-scripts test # See https://github.com/facebook/jest/issues/11354",
+    "test:coverage": "react-scripts test --coverage --watchAll=false",
+    "tdd-test": "tsx test-orchestrator/cli.ts",
+    "tdd-install": "playwright install chromium",
+    "playwright": "playwright test",
+    "playwright:ui": "playwright test --ui",
+    "playwright:report": "playwright show-report"
   },
   "browserslist": {
     "production": [

@@ -1,0 +1,21 @@
+# Test Reports and Artifacts
+reports/
+dist/
+
+# Videos
+*.webm
+*.mp4
+
+# Screenshots
+*.png
+*.jpg
+
+# Playwright
+test-results/
+playwright-report/
+
+# Node
+node_modules/
+
+# Logs
+*.log

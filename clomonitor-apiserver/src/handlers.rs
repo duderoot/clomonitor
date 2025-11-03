@@ -437,6 +437,60 @@ pub(crate) async fn track_view(
     }
 }
 
+/// Query parameters for get_unmapped_components endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct UnmappedComponentsParams {
+    pub foundation_id: Option<String>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub search: Option<String>,
+}
+
+/// Handler that returns unmapped DT components.
+pub(crate) async fn get_unmapped_components(
+    State(db): State<DynDB>,
+    Query(params): Query<UnmappedComponentsParams>,
+) -> impl IntoResponse {
+    let input = json!({
+        "foundation_id": params.foundation_id,
+        "limit": params.limit.unwrap_or(20),
+        "offset": params.offset.unwrap_or(0),
+        "search": params.search,
+    });
+
+    match db.get_unmapped_components(&input).await {
+        Ok(data) => {
+            let headers = [(CONTENT_TYPE, APPLICATION_JSON.to_string())];
+            Ok((headers, response::Json(data)))
+        }
+        Err(err) => Err(internal_error(err)),
+    }
+}
+
+/// Query parameters for get_unmapped_stats endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct UnmappedStatsParams {
+    pub foundation_id: Option<String>,
+}
+
+/// Handler that returns unmapped DT components statistics.
+pub(crate) async fn get_unmapped_stats(
+    State(db): State<DynDB>,
+    Query(params): Query<UnmappedStatsParams>,
+) -> impl IntoResponse {
+    let input = json!({
+        "foundation_id": params.foundation_id,
+    });
+
+    match db.get_unmapped_stats(&input).await {
+        Ok(data) => {
+            let headers = [(CONTENT_TYPE, APPLICATION_JSON.to_string())];
+            Ok((headers, response::Json(data)))
+        }
+        Err(err) => Err(internal_error(err)),
+    }
+}
+
 /// Helper for mapping any error into a `500 Internal Server Error` response.
 #[allow(clippy::needless_pass_by_value)]
 fn internal_error<E>(err: E) -> StatusCode

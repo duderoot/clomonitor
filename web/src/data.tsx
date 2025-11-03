@@ -58,7 +58,10 @@ export const FOUNDATIONS: FoundationInfo = {
   [Foundation.lfnetworking]: {
     name: 'LF Networking',
   },
-};
+  'dt-test': {
+    name: 'DT Test',
+  },
+} as FoundationInfo;
 
 export const DEFAULT_FOUNDATION = Foundation.cncf;
 
@@ -554,7 +557,7 @@ export const REPORT_OPTIONS: ReportOptionInfo = {
 };
 
 export type FoundationInfo = {
-  [key in Foundation]?: {
+  [key: string]: {
     name: string;
   };
 };

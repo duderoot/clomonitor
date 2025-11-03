@@ -68,7 +68,9 @@ pub(crate) fn setup(cfg: &Arc<Config>, db: DynDB, vt: DynVT) -> Result<Router> {
             get(project_snapshot),
         )
         .route("/stats", get(stats))
-        .route("/stats/snapshots/{date}", get(stats_snapshot));
+        .route("/stats/snapshots/{date}", get(stats_snapshot))
+        .route("/dt/unmapped", get(get_unmapped_components))
+        .route("/dt/unmapped/stats", get(get_unmapped_stats));
 
     // Setup router
     let mut router = Router::new()

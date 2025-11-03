@@ -1,3 +1,7 @@
+{{ template "dt/get_unmapped_components.sql" }}
+{{ template "dt/get_unmapped_stats.sql" }}
+{{ template "dt/get_import_stats.sql" }}
+{{ template "dt/record_dt_import.sql" }}
 {{ template "notifications/get_pending_annual_review_notifications.sql" }}
 {{ template "projects/get_project_by_id.sql" }}
 {{ template "projects/get_project_by_name.sql" }}

@@ -1,0 +1,99 @@
+
+services:
+  db:
+    image: postgres:15
+    container_name: clomonitor-db
+    environment:
+      POSTGRES_USER: clomonitor
+      POSTGRES_PASSWORD: clomonitor
+      POSTGRES_DB: clomonitor
+    ports:
+      - "5432:5432"
+    volumes:
+      - clomonitor_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U clomonitor"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - clomonitor-net
+
+  dbmigrator:
+    image: clomonitor/dbmigrator
+    container_name: clomonitor-dbmigrator
+    depends_on:
+      - db
+    command:  /bin/sh -c  "sleep 5 && ./migrate.sh"
+    restart: "on-failure"
+    volumes:
+      - ./config:/home/clomonitor/.config/clomonitor
+    environment:
+      TERN_CONF: /home/clomonitor/.config/clomonitor/tern.conf
+    networks:
+    - clomonitor-net
+
+
+  apiserver:
+    image: clomonitor/apiserver
+    container_name: clomonitor-apiserver
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/home/clomonitor/.config/clomonitor:ro
+    command: [ "/bin/sh", "-c",  "sleep 7 && clomonitor-apiserver -c .config/clomonitor/apiserver.yaml"]
+    networks:
+      - clomonitor-net
+
+  registrar:
+    image: clomonitor/registrar
+    container_name: clomonitor-registrar
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - GITHUB_TOKEN=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
+    volumes:
+      - ./config:/home/clomonitor/.config/clomonitor:ro
+    command: ["/bin/sh", "-c", "sleep 15 && clomonitor-registrar -c .config/clomonitor/registrar.yaml"]
+    networks:
+      - clomonitor-net
+
+  tracker:
+    image: clomonitor/tracker
+    container_name: clomonitor-tracker
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      - ./config:/home/clomonitor/.config/clomonitor:ro
+    command: ["/bin/sh", "-c", "sleep 10 && clomonitor-tracker -c .config/clomonitor/tracker.yaml"]
+    networks:
+      - clomonitor-net
+
+  archiver:
+    build:
+      context: ..
+      dockerfile: clomonitor-archiver/Dockerfile
+    image: clomonitor/archiver
+    container_name: clomonitor-archiver
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./config:/home/clomonitor/.config/clomonitor:ro
+    command: ["/bin/sh", "-c", "sleep 10 && clomonitor-archiver -c /home/clomonitor/.config/clomonitor/archiver.yaml"]
+    networks:
+      - clomonitor-net
+
+volumes:
+  clomonitor_db_data:
+
+networks:
+  clomonitor-net:
+    driver: bridge

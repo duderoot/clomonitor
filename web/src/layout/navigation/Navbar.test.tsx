@@ -85,4 +85,29 @@ describe('Navbar', () => {
 
     expect(window.location.pathname).toBe('/stats');
   });
+
+  it('renders DT Visibility link', () => {
+    render(
+      <Router>
+        <Navbar {...defaultProps} />
+      </Router>
+    );
+
+    const dtLink = screen.getByRole('link', { name: /DT Visibility/i });
+    expect(dtLink).toBeInTheDocument();
+    expect(dtLink).toHaveAttribute('href', '/dt-visibility');
+  });
+
+  it('clicks DT Visibility page', async () => {
+    render(
+      <Router>
+        <Navbar {...defaultProps} />
+      </Router>
+    );
+
+    const dtLink = screen.getByRole('link', { name: /DT Visibility/i });
+    await userEvent.click(dtLink);
+
+    expect(window.location.pathname).toBe('/dt-visibility');
+  });
 });

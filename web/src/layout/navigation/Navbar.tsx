@@ -42,6 +42,12 @@ const Navbar = (props: Props) => {
           >
             Stats
           </Link>
+          <Link
+            to="/dt-visibility"
+            className={`position-relative ms-4 text-light text-uppercase fw-bold text-decoration-none ${styles.link} navbarLink`}
+          >
+            DT Visibility
+          </Link>
           <Settings />
         </div>
       </>

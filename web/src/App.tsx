@@ -7,6 +7,7 @@ import { BrowserRouter as Router, Navigate, Route, Routes, useParams } from 'rea
 import { AppContextProvider } from './context/AppContextProvider';
 import Layout from './layout';
 import Detail from './layout/detail';
+import DTView from './layout/dt';
 import NotFound from './layout/notFound';
 import Search from './layout/search';
 
@@ -41,14 +42,8 @@ function App() {
             />
             <Route path="projects/:project" element={<ProjectsRedirection />} />
             <Route path="projects/:foundation/:project" element={<Detail setInvisibleFooter={setInvisibleFooter} />} />
-            <Route
-              path="stats"
-              element={
-                <Suspense fallback={null}>
-                  <StatsView />
-                </Suspense>
-              }
-            />
+            <Route path="stats" element={<StatsView />} />
+            <Route path="dt-visibility" element={<DTView />} />
             <Route path="*" element={<NotFound />} />
           </Route>
         </Routes>
