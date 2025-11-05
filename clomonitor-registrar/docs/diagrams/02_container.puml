@@ -1,0 +1,36 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Container Diagram - CLOMonitor Registrar
+
+Person(admin, "Administrator", "Runs and monitors registrar")
+
+System_Boundary(registrar_system, "CLOMonitor Registrar System") {
+    Container(registrar_app, "Registrar Application", "Rust/Tokio", "Async process that fetches and registers project data")
+    ContainerDb(cache, "In-Memory Cache", "HashMap", "Caches component URL mappings during execution")
+}
+
+System_Ext(yaml_source, "Foundation YAML", "HTTPS")
+System_Ext(dt_api, "Dependency-Track API", "REST API")
+System_Ext(registry_apis, "Package Registries", "npm, Maven, PyPI")
+
+ContainerDb(postgres, "PostgreSQL Database", "PostgreSQL 14+", "Stores foundations, projects, repositories, component mappings")
+
+Rel(admin, registrar_app, "Runs", "CLI with config file")
+Rel(registrar_app, yaml_source, "Fetches YAML", "HTTPS GET")
+Rel(registrar_app, dt_api, "Fetches projects & components", "HTTPS GET with X-Api-Key")
+Rel(registrar_app, registry_apis, "Looks up repo URLs", "HTTPS GET")
+Rel(registrar_app, cache, "Reads/writes mappings", "In-process")
+Rel(registrar_app, postgres, "Calls database functions", "PostgreSQL/TLS")
+Rel_Back(postgres, registrar_app, "Returns foundation & project data", "SQL results")
+
+note right of registrar_app
+  Concurrent processing with:
+  - Configurable concurrency level
+  - 300s timeout per foundation
+  - Retry logic for rate limits
+end note
+
+@enduml

@@ -1,0 +1,33 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+LAYOUT_WITH_LEGEND()
+
+title System Context Diagram - CLOMonitor Registrar
+
+Person(admin, "System Administrator", "Configures and monitors the registrar")
+
+System(registrar, "CLOMonitor Registrar", "Fetches project data from multiple sources and registers them in the database for health monitoring")
+
+System_Ext(yaml_files, "Foundation YAML Files", "YAML files hosted by CNCF, LF AI, CDF containing project metadata")
+System_Ext(dependency_track, "Dependency-Track", "OWASP Dependency-Track instances containing component/library information")
+System_Ext(npm_registry, "npm Registry", "Public npm registry for package metadata lookups")
+System_Ext(maven_registry, "Maven Central", "Maven Central repository for Java package metadata")
+System_Ext(pypi_registry, "PyPI Registry", "Python Package Index for Python package metadata")
+
+SystemDb(database, "PostgreSQL Database", "Stores foundation, project, and repository data")
+
+System(tracker, "CLOMonitor Tracker", "Analyzes registered repositories for health metrics")
+System(api, "CLOMonitor API Server", "Serves project data via HTTP API")
+
+Rel(admin, registrar, "Configures and runs", "YAML config")
+Rel(registrar, yaml_files, "Fetches project lists", "HTTPS")
+Rel(registrar, dependency_track, "Fetches components", "HTTPS/REST API")
+Rel(registrar, npm_registry, "Looks up repository URLs", "HTTPS")
+Rel(registrar, maven_registry, "Looks up repository URLs", "HTTPS")
+Rel(registrar, pypi_registry, "Looks up repository URLs", "HTTPS")
+Rel(registrar, database, "Registers/unregisters projects", "PostgreSQL/TLS")
+Rel(tracker, database, "Reads projects to analyze", "PostgreSQL/TLS")
+Rel(api, database, "Reads project data", "PostgreSQL/TLS")
+
+@enduml

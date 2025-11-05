@@ -1,0 +1,214 @@
+@startuml
+title Sequence Diagram - Dependency-Track Processing (RESILIENT - Incremental Registration)
+
+participant "Registrar" as reg
+participant "DT Client" as dt_client
+participant "DT Mapper" as mapper
+participant "Registry Router" as router
+participant "npm Client" as npm
+participant "DB Layer" as db
+participant "DT API" as dt_api
+participant "npm Registry" as npm_api
+database "PostgreSQL" as pg
+
+note over reg
+  IMPROVEMENT: Incremental registration
+  - Register projects immediately after mapping
+  - Don't accumulate all in memory
+  - Partial progress on failure
+end note
+
+reg -> dt_client: get_projects()
+activate dt_client
+
+loop Pagination (page 1, 2, 3...)
+    dt_client -> dt_api: GET /api/v1/project\n?pageNumber=N&pageSize=100\nX-Api-Key: xxx
+    dt_api --> dt_client: [DtProject] + X-Total-Count
+
+    alt Status 429 (Rate Limited)
+        dt_client -> dt_client: Sleep with exponential backoff
+        dt_client -> dt_api: Retry GET request
+    end
+end
+
+dt_client --> reg: Vec<DtProject>
+deactivate dt_client
+
+note over reg
+  Track registered projects in current run
+  (for cleanup phase)
+end note
+
+reg -> reg: registered_in_this_run = HashSet::new()
+
+loop For each DT project (FAILURE = Continue to Next)
+    note over reg #FFAAAA
+      🔄 CHECKPOINT: Process ONE DT project at a time
+      Failure here only loses current project, not all
+    end note
+
+    reg -> dt_client: get_project_components(project_uuid)
+    activate dt_client
+
+    loop Pagination
+        dt_client -> dt_api: GET /api/v1/component/project/{uuid}\n?pageNumber=N&pageSize=100
+        dt_api --> dt_client: [DtComponent] + X-Total-Count
+    end
+
+    dt_client --> reg: Vec<DtComponent>
+    deactivate dt_client
+
+    loop For each component in THIS DT project only
+        reg -> mapper: should_process_component(component)
+        activate mapper
+        mapper --> reg: bool (LIBRARY or FRAMEWORK)
+        deactivate mapper
+
+        alt Should process
+            reg -> mapper: extract_repository_url_with_lookup(\ncomponent, registry_router, db)
+            activate mapper
+
+            alt Has externalReferences[vcs]
+                mapper --> reg: Some(repo_url)
+            else purl is GitHub/GitLab
+                mapper -> mapper: extract_url_from_purl()
+                mapper --> reg: Some(repo_url)
+            else Check database cache
+                mapper -> db: get_component_mapping(purl)
+                activate db
+                db -> pg: SELECT repo_url FROM component_mapping\nWHERE purl = $1
+                pg --> db: repo_url or NULL
+                db --> mapper: Option<String>
+                deactivate db
+
+                alt Cache hit
+                    mapper --> reg: Some(cached_url)
+                else Cache miss & registry enabled
+                    mapper -> router: lookup_repository_url(purl)
+                    activate router
+
+                    router -> router: Parse purl type
+
+                    alt purl type = npm
+                        router -> npm: get_repository_url(package_name)
+                        activate npm
+                        npm -> npm_api: GET /{package_name}
+                        npm_api --> npm: Package metadata JSON
+                        npm -> npm: Extract repository.url
+                        npm --> router: Option<String>
+                        deactivate npm
+                    end
+
+                    router --> mapper: Option<String>
+                    deactivate router
+
+                    alt Lookup successful
+                        mapper -> db: save_component_mapping(\npurl, repo_url, "npm", confidence)
+                        activate db
+                        db -> pg: INSERT INTO component_mapping
+                        db --> mapper: Ok()
+                        deactivate db
+                        mapper --> reg: Some(repo_url)
+                    end
+                end
+            end
+            deactivate mapper
+
+            alt repo_url found
+                reg -> mapper: convert_component_to_project(\ncomponent, dt_project_name)
+                activate mapper
+                mapper -> mapper: Format names
+                mapper -> mapper: Create Project struct
+                mapper -> mapper: Calculate digest
+                mapper --> reg: Result<Project>
+                deactivate mapper
+
+                note over reg #AAFFAA
+                  ✅ IMMEDIATE REGISTRATION
+                  Don't wait for all components
+                end note
+
+                reg -> db: Check if already registered\nwith same digest
+                activate db
+                db -> pg: SELECT digest FROM project\nWHERE name = $1
+                pg --> db: Option<digest>
+                deactivate db
+
+                alt New or digest changed
+                    reg -> db: register_project(foundation_id, project)
+                    activate db
+                    db -> pg: SELECT register_project($1::text, $2::jsonb)
+                    pg --> db: Success ✅
+                    db --> reg: Ok()
+                    deactivate db
+
+                    note over reg #AAFFAA
+                      ✅ PROJECT COMMITTED
+                      Restart will skip this project
+                      (digest check prevents re-registration)
+                    end note
+
+                    reg -> reg: registered_in_this_run.insert(project.name)
+                else Digest unchanged
+                    note over reg
+                      Skip registration (already up-to-date)
+                    end note
+                    reg -> reg: registered_in_this_run.insert(project.name)
+                end
+
+            else repo_url NOT found
+                reg -> db: save_unmapped_component(\nfoundation_id, component)
+                activate db
+                db -> pg: INSERT INTO unmapped_component\nON CONFLICT DO NOTHING
+                db --> reg: Ok()
+                deactivate db
+
+                note over reg #AAFFAA
+                  ✅ UNMAPPED SAVED
+                  Tracked for later review
+                end note
+            end
+        end
+    end
+
+    note over reg #AAFFAA
+      ✅ DT PROJECT COMPLETE
+      All components processed and registered
+      Failure in NEXT project won't affect this one
+    end note
+end
+
+note over reg
+  All DT projects processed
+  Now cleanup removed projects
+end note
+
+reg -> db: foundation_projects(foundation_id)
+activate db
+db -> pg: SELECT project_name, digest\nFROM project WHERE foundation_id = $1
+pg --> db: All currently registered projects
+db --> reg: HashMap<name, digest>
+deactivate db
+
+loop For each registered project NOT in this run
+    alt Project no longer in DT
+        reg -> db: unregister_project(foundation_id, name)
+        activate db
+        db -> pg: SELECT unregister_project($1::text, $2::text)
+        pg --> db: Success
+        db --> reg: Ok()
+        deactivate db
+
+        note over reg
+          Remove project that's no longer in DT
+        end note
+    end
+end
+
+note over reg #AAFFAA
+  ✅ PROCESSING COMPLETE
+  Total: X projects registered, Y unmapped
+  All changes committed incrementally
+end note
+
+@enduml

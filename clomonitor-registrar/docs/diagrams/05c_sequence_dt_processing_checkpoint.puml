@@ -1,0 +1,209 @@
+@startuml
+title Sequence Diagram - DT Processing with Checkpoint/Resume (Advanced Resilience)
+
+participant "Registrar" as reg
+participant "Checkpoint Manager" as ckpt
+participant "DT Client" as dt_client
+participant "DB Layer" as db
+participant "DT API" as dt_api
+database "PostgreSQL" as pg
+database "Checkpoint Table" as ckpt_table
+
+note over reg
+  ADVANCED STRATEGY: Checkpoint/Resume
+  - Track processing state in database
+  - Resume from last successful checkpoint
+  - Retry individual failed projects
+end note
+
+== Initialization Phase ==
+
+reg -> ckpt: load_or_create_checkpoint(foundation_id)
+activate ckpt
+
+ckpt -> pg: SELECT * FROM dt_processing_state\nWHERE foundation_id = $1
+pg --> ckpt: Existing checkpoint rows (if any)
+
+ckpt --> reg: Checkpoint state
+deactivate ckpt
+
+note over reg #FFFFAA
+  Checkpoint shows:
+  - 500 projects: completed ✅
+  - 50 projects: failed ❌
+  - 450 projects: pending ⏳
+
+  Resume from where we left off!
+end note
+
+== Fetch DT Projects ==
+
+reg -> dt_client: get_projects()
+activate dt_client
+dt_client -> dt_api: GET /api/v1/project
+dt_api --> dt_client: Vec<DtProject>
+dt_client --> reg: All DT projects (1000 total)
+deactivate dt_client
+
+== Filter to Pending Projects ==
+
+reg -> ckpt: filter_to_pending(dt_projects)
+activate ckpt
+
+loop For each DT project
+    ckpt -> ckpt_table: SELECT processing_status\nWHERE dt_project_uuid = $1
+    ckpt_table --> ckpt: status
+
+    alt status = 'completed'
+        note over ckpt
+          ✅ Skip (already processed)
+        end note
+    else status = 'failed' OR 'pending'
+        note over ckpt
+          ⏳ Include (needs processing)
+        end note
+    end
+end
+
+ckpt --> reg: Filtered projects (500 pending)
+deactivate ckpt
+
+note over reg #AAFFAA
+  Only process 500 projects
+  (500 already done, skipped)
+end note
+
+== Process Each Pending Project ==
+
+loop For each pending DT project
+
+    note over reg #FFFFAA
+      🔄 CHECKPOINT START
+    end note
+
+    reg -> ckpt: mark_in_progress(dt_project_uuid)
+    activate ckpt
+    ckpt -> ckpt_table: UPDATE dt_processing_state\nSET processing_status = 'in_progress',\n    last_updated = NOW()\nWHERE dt_project_uuid = $1
+    ckpt --> reg: Ok()
+    deactivate ckpt
+
+    reg -> dt_client: get_project_components(project_uuid)
+    activate dt_client
+    dt_client -> dt_api: GET /api/v1/component/project/{uuid}
+    dt_api --> dt_client: Vec<DtComponent>
+    dt_client --> reg: Components
+    deactivate dt_client
+
+    loop For each component
+        reg -> reg: Process component\n(extract URL, map, register)
+
+        reg -> db: register_project_if_changed(...)
+        activate db
+        db -> pg: SELECT register_project($1::text, $2::jsonb)
+        db --> reg: Ok()
+        deactivate db
+
+        reg -> ckpt: increment_components_processed()
+        activate ckpt
+        ckpt -> ckpt_table: UPDATE dt_processing_state\nSET components_processed = components_processed + 1
+        ckpt --> reg: Ok()
+        deactivate ckpt
+    end
+
+    alt Processing succeeded
+        reg -> ckpt: mark_completed(dt_project_uuid)
+        activate ckpt
+        ckpt -> ckpt_table: UPDATE dt_processing_state\nSET processing_status = 'completed',\n    last_updated = NOW(),\n    error_message = NULL\nWHERE dt_project_uuid = $1
+        ckpt --> reg: Ok()
+        deactivate ckpt
+
+        note over reg #AAFFAA
+          ✅ CHECKPOINT SAVED
+          Project completed and won't be reprocessed
+        end note
+
+    else Processing failed
+        reg -> ckpt: mark_failed(dt_project_uuid, error_msg)
+        activate ckpt
+        ckpt -> ckpt_table: UPDATE dt_processing_state\nSET processing_status = 'failed',\n    last_updated = NOW(),\n    error_message = $2\nWHERE dt_project_uuid = $1
+        ckpt --> reg: Ok()
+        deactivate ckpt
+
+        note over reg #FFAAAA
+          ❌ CHECKPOINT SAVED WITH ERROR
+          Can retry this project later
+          Other projects continue
+        end note
+    end
+end
+
+== Cleanup Phase ==
+
+reg -> db: Get all registered projects
+activate db
+db -> pg: SELECT project_name FROM project\nWHERE foundation_id = $1
+pg --> db: All registered projects
+db --> reg: HashMap
+deactivate db
+
+reg -> ckpt: get_all_processed_components()
+activate ckpt
+ckpt -> ckpt_table: SELECT dt_project_uuid\nFROM dt_processing_state\nWHERE processing_status = 'completed'
+ckpt_table --> ckpt: Completed project UUIDs
+ckpt --> reg: Components to keep
+deactivate ckpt
+
+loop For each registered project
+    alt Not in any completed DT project
+        reg -> db: unregister_project(foundation_id, name)
+        activate db
+        db -> pg: SELECT unregister_project($1, $2)
+        db --> reg: Ok()
+        deactivate db
+    end
+end
+
+== Final Cleanup ==
+
+reg -> ckpt: is_all_completed()
+activate ckpt
+ckpt -> ckpt_table: SELECT COUNT(*)\nFROM dt_processing_state\nWHERE processing_status != 'completed'
+ckpt_table --> ckpt: count
+deactivate ckpt
+
+alt All projects completed
+    reg -> ckpt: clear_checkpoint()
+    activate ckpt
+    ckpt -> ckpt_table: DELETE FROM dt_processing_state\nWHERE foundation_id = $1
+    ckpt --> reg: Ok()
+    deactivate ckpt
+
+    note over reg #AAFFAA
+      ✅ ALL COMPLETE
+      Checkpoint cleared
+    end note
+else Some projects failed
+    note over reg #FFFFAA
+      ⚠️ PARTIAL COMPLETION
+      Checkpoint preserved
+      Failed projects can be retried:
+
+      SELECT * FROM dt_processing_state
+      WHERE processing_status = 'failed'
+      ORDER BY last_updated DESC
+    end note
+end
+
+note over reg
+  RESUME CAPABILITY:
+
+  Next run will:
+  1. Load checkpoint
+  2. See 500 completed ✅
+  3. Process 50 failed ❌
+  4. Skip 500 completed
+
+  No wasted work!
+end note
+
+@enduml

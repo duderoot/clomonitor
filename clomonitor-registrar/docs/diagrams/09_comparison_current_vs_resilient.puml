@@ -1,0 +1,67 @@
+@startuml
+title Comparison - Current vs Resilient Processing
+
+!define CURRENT_COLOR #FFCCCC
+!define RESILIENT_COLOR #CCFFCC
+
+package "Current Implementation (All-or-Nothing)" CURRENT_COLOR {
+    [1. Fetch ALL DT Projects] as current_fetch
+    [2. Fetch ALL Components\n(50,000+ in memory)] as current_components
+    [3. Map ALL Components\n(in memory HashMap)] as current_map
+    [4. Save ALL Unmapped\n(batch at end)] as current_unmapped
+    [5. Register ALL Projects\n(batch at end)] as current_register
+
+    current_fetch --> current_components
+    current_components --> current_map
+    current_map --> current_unmapped
+    current_unmapped --> current_register
+
+    note right of current_register
+        ❌ PROBLEM:
+        Failure at ANY step = lose ALL work
+
+        Example:
+        - 999/1000 projects processed
+        - Error on project 1000
+        - ALL 999 projects lost
+        - Restart from project 1
+    end note
+}
+
+package "Resilient Implementation (Incremental)" RESILIENT_COLOR {
+    [1. Fetch DT Projects] as resilient_fetch
+
+    package "Per-Project Loop" {
+        [2. Fetch Components\n(for ONE project)] as resilient_components
+        [3. Map Components\n(for ONE project)] as resilient_map
+
+        package "Per-Component" {
+            [4. Extract URL] as resilient_url
+            [5. IMMEDIATE Save Unmapped\nOR\n6. IMMEDIATE Register Project] as resilient_immediate
+        }
+    }
+
+    [7. Cleanup Removed Projects] as resilient_cleanup
+
+    resilient_fetch --> resilient_components
+    resilient_components --> resilient_map
+    resilient_map --> resilient_url
+    resilient_url --> resilient_immediate
+    resilient_immediate --> resilient_components : Next component
+    resilient_components --> resilient_cleanup : After all projects
+
+    note right of resilient_immediate
+        ✅ IMPROVEMENT:
+        Each project commits independently
+
+        Example:
+        - 999/1000 projects processed ✅
+        - Error on project 1000 ❌
+        - 999 projects PRESERVED
+        - Restart only processes project 1000
+
+        Digest check prevents duplicates!
+    end note
+}
+
+@enduml

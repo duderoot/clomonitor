@@ -1,0 +1,77 @@
+@startuml
+title Sequence Diagram - YAML Foundation Processing
+
+actor Admin
+participant "Main" as main
+participant "Registrar" as reg
+participant "DB Layer" as db
+participant "HTTP Client" as http
+participant "YAML File" as yaml
+database "PostgreSQL" as pg
+
+Admin -> main: Run with config
+activate main
+
+main -> main: Load config from YAML
+main -> main: Setup logging
+main -> main: Setup DB pool with TLS
+main -> reg: run(config, db)
+activate reg
+
+reg -> db: foundations()
+activate db
+db -> pg: SELECT foundation_id, \ndata_source_type, data_source_config
+pg --> db: Foundation rows
+db --> reg: Vec<Foundation>
+deactivate db
+
+loop For each foundation (concurrent, configurable limit)
+    reg -> reg: Timeout(300s)
+
+    alt data_source == YamlUrl
+        reg -> http: GET data_url
+        activate http
+        http -> yaml: HTTPS GET
+        yaml --> http: YAML content
+        http --> reg: Response body
+        deactivate http
+
+        reg -> reg: Parse YAML to Vec<Project>
+        reg -> reg: Filter excluded repos
+        reg -> reg: Calculate digests
+
+        reg -> db: foundation_projects(foundation_id)
+        activate db
+        db -> pg: SELECT project_name, digest
+        pg --> db: Existing projects
+        db --> reg: HashMap<name, digest>
+        deactivate db
+
+        loop For each project
+            alt New or digest changed
+                reg -> db: register_project(foundation_id, project)
+                activate db
+                db -> pg: SELECT register_project($1::text, $2::jsonb)
+                pg --> db: Success
+                db --> reg: Ok()
+                deactivate db
+            end
+        end
+
+        loop For each existing project not in YAML
+            reg -> db: unregister_project(foundation_id, name)
+            activate db
+            db -> pg: SELECT unregister_project($1::text, $2::text)
+            pg --> db: Success
+            db --> reg: Ok()
+            deactivate db
+        end
+    end
+end
+
+reg --> main: Ok()
+deactivate reg
+main --> Admin: Exit
+deactivate main
+
+@enduml

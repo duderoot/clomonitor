@@ -1,0 +1,47 @@
+@startuml
+title Deployment Diagram - CLOMonitor Registrar
+
+node "Application Server" {
+    component "clomonitor-registrar" as registrar
+    note right of registrar
+      Runtime: Tokio async runtime
+      Config: YAML file
+      Environment: RUST_LOG=debug
+    end note
+}
+
+node "Database Server" {
+    database "PostgreSQL 14+" as db
+    note right of db
+      Tables:
+      - foundation
+      - project
+      - repository
+      - component_mapping
+      - unmapped_component
+    end note
+}
+
+cloud "Internet" {
+    component "Foundation YAML Files" as yaml
+    component "Dependency-Track API" as dt
+    component "npm Registry" as npm
+    component "Maven Central" as maven
+    component "PyPI" as pypi
+}
+
+registrar -down-> db : PostgreSQL/TLS\n(port 5432)
+registrar -up-> yaml : HTTPS
+registrar -up-> dt : HTTPS + X-Api-Key
+registrar -up-> npm : HTTPS
+registrar -up-> maven : HTTPS
+registrar -up-> pypi : HTTPS
+
+note right of registrar
+  Execution modes:
+  1. Cron job (periodic)
+  2. Manual execution
+  3. Docker container
+end note
+
+@enduml

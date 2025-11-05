@@ -1,0 +1,148 @@
+@startuml
+title Sequence Diagram - Dependency-Track Foundation Processing
+
+participant "Registrar" as reg
+participant "DT Client" as dt_client
+participant "DT Mapper" as mapper
+participant "Registry Router" as router
+participant "npm Client" as npm
+participant "DB Layer" as db
+participant "DT API" as dt_api
+participant "npm Registry" as npm_api
+database "PostgreSQL" as pg
+
+reg -> dt_client: get_projects()
+activate dt_client
+
+loop Pagination (page 1, 2, 3...)
+    dt_client -> dt_api: GET /api/v1/project\n?pageNumber=N&pageSize=100\nX-Api-Key: xxx
+    dt_api --> dt_client: [DtProject] + X-Total-Count
+
+    alt Status 429 (Rate Limited)
+        dt_client -> dt_client: Sleep with exponential backoff
+        dt_client -> dt_api: Retry GET request
+    end
+end
+
+dt_client --> reg: Vec<DtProject>
+deactivate dt_client
+
+loop For each DT project
+    reg -> dt_client: get_project_components(project_uuid)
+    activate dt_client
+
+    loop Pagination
+        dt_client -> dt_api: GET /api/v1/component/project/{uuid}\n?pageNumber=N&pageSize=100
+        dt_api --> dt_client: [DtComponent] + X-Total-Count
+    end
+
+    dt_client --> reg: Vec<DtComponent>
+    deactivate dt_client
+
+    loop For each component
+        reg -> mapper: should_process_component(component)
+        activate mapper
+        mapper --> reg: bool (LIBRARY or FRAMEWORK)
+        deactivate mapper
+
+        alt Should process
+            reg -> mapper: extract_repository_url_with_lookup(\ncomponent, registry_router, db)
+            activate mapper
+
+            alt Has externalReferences[vcs]
+                mapper --> reg: Some(repo_url)
+            else purl is GitHub/GitLab
+                mapper -> mapper: extract_url_from_purl()
+                mapper --> reg: Some(repo_url)
+            else Check database cache
+                mapper -> db: get_component_mapping(purl)
+                activate db
+                db -> pg: SELECT repo_url FROM component_mapping\nWHERE purl = $1
+                pg --> db: repo_url or NULL
+                db --> mapper: Option<String>
+                deactivate db
+
+                alt Cache hit
+                    mapper --> reg: Some(cached_url)
+                else Cache miss & registry enabled
+                    mapper -> router: lookup_repository_url(purl)
+                    activate router
+
+                    router -> router: Parse purl type
+
+                    alt purl type = npm
+                        router -> npm: get_repository_url(package_name)
+                        activate npm
+                        npm -> npm_api: GET /{package_name}
+                        npm_api --> npm: Package metadata JSON
+                        npm -> npm: Extract repository.url
+                        npm --> router: Option<String>
+                        deactivate npm
+                    end
+
+                    router --> mapper: Option<String>
+                    deactivate router
+
+                    alt Lookup successful
+                        mapper -> db: save_component_mapping(\npurl, repo_url, "npm", confidence)
+                        activate db
+                        db -> pg: INSERT INTO component_mapping
+                        db --> mapper: Ok()
+                        deactivate db
+                        mapper --> reg: Some(repo_url)
+                    else Lookup failed
+                        mapper -> db: save_unmapped_component(\nfoundation_id, component)
+                        activate db
+                        db -> pg: INSERT INTO unmapped_component
+                        db --> mapper: Ok()
+                        deactivate db
+                        mapper --> reg: None
+                    end
+                end
+            end
+            deactivate mapper
+
+            alt repo_url found
+                reg -> mapper: convert_component_to_project(\ncomponent, dt_project_name)
+                activate mapper
+                mapper -> mapper: Format names (name, display_name)
+                mapper -> mapper: Create Repository struct
+                mapper -> mapper: Create Project struct
+                mapper -> mapper: Calculate digest
+                mapper --> reg: Result<Project>
+                deactivate mapper
+
+                reg -> reg: Add to all_projects_to_register
+            end
+        end
+    end
+end
+
+reg -> db: foundation_projects(foundation_id)
+activate db
+db -> pg: SELECT project_name, digest
+pg --> db: Existing projects
+db --> reg: HashMap<name, digest>
+deactivate db
+
+loop For each project to register
+    alt New or changed
+        reg -> db: register_project(foundation_id, project)
+        activate db
+        db -> pg: SELECT register_project($1::text, $2::jsonb)
+        pg --> db: Success
+        db --> reg: Ok()
+        deactivate db
+    end
+end
+
+loop For each removed project
+    reg -> db: unregister_project(foundation_id, name)
+    activate db
+    db -> pg: SELECT unregister_project($1::text, $2::text)
+    pg --> db: Success
+    db --> reg: Ok()
+    deactivate db
+end
+
+@enduml

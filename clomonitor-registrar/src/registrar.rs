@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::{HashMap, HashSet}, time::Duration};
 
 use anyhow::{Context, Error, Result, format_err};
 use config::Config;
@@ -333,105 +333,51 @@ async fn process_dt_foundation(
 
     // Fetch all projects from DT
     let dt_projects = dt_client.get_projects().await?;
-    debug!("Found {} DT projects", dt_projects.len());
+    debug!("Found {} DT projects to process", dt_projects.len());
 
-    // Collect all components from all projects and convert to CLOMonitor projects
-    let mut all_projects_to_register = HashMap::new();
-    let mut unmapped_components = Vec::new();
-    let mut mapped_count = 0;
-    let mut unmapped_count = 0;
+    // Track what we've registered in this run (for cleanup phase)
+    let mut registered_in_this_run = HashSet::new();
+    let mut stats = ProcessingStats::default();
 
+    // Process each DT project independently with per-project error handling
     for dt_project in dt_projects {
-        debug!(
-            "Processing DT project: {} ({})",
-            dt_project.name, dt_project.uuid
-        );
-
-        let components = dt_client.get_project_components(&dt_project.uuid).await?;
-        debug!(
-            "Found {} components in project {}",
-            components.len(),
-            dt_project.name
-        );
-
-        for component in components {
-            // Filter components
-            if !should_process_component(&component) {
-                debug!(
-                    "Skipping component {} with classifier {}",
-                    component.name, component.classifier
-                );
-                continue;
+        match process_single_dt_project(
+            &db,
+            &dt_client,
+            &dt_project,
+            &foundation.foundation_id,
+            registry_router.as_ref(),
+        )
+        .await
+        {
+            Ok(result) => {
+                stats.merge(&result);
+                registered_in_this_run.extend(result.registered_names);
             }
-
-            // Try to find repository URL with DB lookup and optional registry APIs
-            match extract_repository_url_with_lookup(&component, &db, registry_router.as_ref()).await {
-                RepositoryLookupResult::Found(repo_url) => {
-                    // Create CLOMonitor project with the found repository URL
-                    match build_project_from_component(&component, &dt_project.name, repo_url) {
-                        Ok(project) => {
-                            all_projects_to_register.insert(project.name.clone(), project);
-                            mapped_count += 1;
-                        }
-                        Err(e) => {
-                            error!("Failed to build project for component {}: {}", component.name, e);
-                        }
-                    }
-                }
-                RepositoryLookupResult::NotFound(unmapped) => {
-                    debug!("No repository URL found for component {}", component.name);
-                    unmapped_components.push(unmapped);
-                    unmapped_count += 1;
-                }
+            Err(e) => {
+                error!(
+                    "Failed to process DT project {} ({}): {}",
+                    dt_project.name, dt_project.uuid, e
+                );
+                stats.errors.push(format!("{}: {}", dt_project.name, e));
+                // Continue to next project instead of failing entire run
             }
         }
     }
 
     info!(
-        "DT foundation {}: {} components mapped, {} unmapped, {} total projects",
+        "DT foundation {}: {} projects processed, {} components mapped, {} unmapped, {} registration failures, {} unmapped save failures, {} project errors",
         foundation.foundation_id,
-        mapped_count,
-        unmapped_count,
-        all_projects_to_register.len()
+        stats.projects_processed,
+        stats.components_mapped,
+        stats.components_unmapped,
+        stats.failed_registrations,
+        stats.failed_unmapped_saves,
+        stats.errors.len()
     );
 
-    // Store all unmapped components for later review
-    for unmapped in unmapped_components {
-        if let Err(e) = db.save_unmapped_component(&foundation.foundation_id, &unmapped).await {
-            error!("Failed to save unmapped component {}: {}", unmapped.component_name, e);
-        }
-    }
-
-    // Get currently registered projects
-    let foundation_id = &foundation.foundation_id;
-    let projects_registered = db.foundation_projects(foundation_id).await?;
-
-    // Register or update projects
-    for (name, project) in &all_projects_to_register {
-        // Check if the project is already registered
-        if let Some(registered_digest) = projects_registered.get(name) {
-            if registered_digest == &project.digest {
-                continue;
-            }
-        }
-
-        debug!(project = project.name, "registering");
-        if let Err(err) = db.register_project(foundation_id, project).await {
-            error!(?err, project = project.name, "error registering");
-        }
-    }
-
-    // Unregister projects no longer in DT
-    if !all_projects_to_register.is_empty() {
-        for name in projects_registered.keys() {
-            if !all_projects_to_register.contains_key(name) {
-                debug!(project = name, "unregistering");
-                if let Err(err) = db.unregister_project(foundation_id, name).await {
-                    error!(?err, project = name, "error unregistering");
-                }
-            }
-        }
-    }
+    // Cleanup projects no longer in DT
+    cleanup_removed_projects(&db, &foundation.foundation_id, &registered_in_this_run).await?;
 
     debug!(duration_secs = start.elapsed().as_secs(), "completed");
     Ok(())
@@ -522,6 +468,318 @@ fn build_project_from_component(
 
     project.set_digest()?;
     Ok(project)
+}
+
+/// Result of processing a single DT project with detailed error tracking.
+///
+/// This structure provides granular visibility into the outcome of processing
+/// a single Dependency-Track project, including success and failure counts.
+#[allow(dead_code)]
+struct ProcessingResult {
+    /// Name of the DT project that was processed
+    dt_project_name: String,
+    /// UUID of the DT project in Dependency-Track
+    dt_project_uuid: String,
+    /// Names of projects successfully registered in this run
+    registered_names: Vec<String>,
+    /// Number of components successfully mapped and registered
+    mapped_count: usize,
+    /// Number of components that could not be mapped to repositories
+    unmapped_count: usize,
+    /// Number of components that failed to register due to errors
+    failed_registrations: usize,
+    /// Number of unmapped components that failed to save
+    failed_unmapped_saves: usize,
+}
+
+/// Aggregated statistics across all DT projects with comprehensive error tracking.
+///
+/// Tracks both successful operations and failures to provide complete visibility
+/// into the registration process. Used for logging and monitoring.
+#[derive(Default)]
+struct ProcessingStats {
+    /// Number of DT projects successfully processed
+    projects_processed: usize,
+    /// Number of components successfully mapped and registered
+    components_mapped: usize,
+    /// Number of components that could not be mapped to repositories
+    components_unmapped: usize,
+    /// Number of registration failures (project creation/update errors)
+    failed_registrations: usize,
+    /// Number of failures saving unmapped components
+    failed_unmapped_saves: usize,
+    /// List of project-level errors with context
+    errors: Vec<String>,
+}
+
+impl ProcessingStats {
+    /// Merge results from a single project into aggregate statistics.
+    ///
+    /// This accumulates counts across all processed DT projects, including
+    /// both successes and failures for comprehensive reporting.
+    fn merge(&mut self, result: &ProcessingResult) {
+        self.projects_processed += 1;
+        self.components_mapped += result.mapped_count;
+        self.components_unmapped += result.unmapped_count;
+        self.failed_registrations += result.failed_registrations;
+        self.failed_unmapped_saves += result.failed_unmapped_saves;
+    }
+}
+
+/// Process a single DT project and immediately register its components.
+///
+/// This function implements the incremental registration pattern where each component
+/// is registered to the database immediately after successful mapping, rather than
+/// accumulating all components in memory and registering in a batch.
+///
+/// # Resilience Strategy
+///
+/// - **Incremental Progress**: Each successfully mapped component is immediately registered,
+///   so progress is preserved even if later components fail.
+/// - **Error Isolation**: Component-level errors (mapping failures, registration failures)
+///   are logged but don't stop processing of other components.
+/// - **Graceful Degradation**: The function continues processing even if some operations
+///   fail, returning a detailed result with success and failure counts.
+///
+/// # Arguments
+///
+/// * `db` - Database connection for registration and unmapped component storage
+/// * `dt_client` - HTTP client for fetching components from Dependency-Track API
+/// * `dt_project` - The DT project to process
+/// * `foundation_id` - Foundation identifier for registration
+/// * `registry_router` - Optional registry API router for npm/Maven/PyPI lookups
+///
+/// # Returns
+///
+/// Returns `Ok(ProcessingResult)` with detailed counts of successes and failures,
+/// or `Err` only if the component fetch from DT API fails (unrecoverable).
+///
+/// # Error Handling
+///
+/// - **DT API errors**: Propagated as `Err` (component fetch failure stops processing)
+/// - **Mapping errors**: Logged, component saved as unmapped, processing continues
+/// - **Registration errors**: Logged, tracked in `failed_registrations`, processing continues
+/// - **Unmapped save errors**: Logged, tracked in `failed_unmapped_saves`, processing continues
+///
+/// # Examples
+///
+/// ```ignore
+/// let result = process_single_dt_project(
+///     &db,
+///     &dt_client,
+///     &dt_project,
+///     "my-foundation",
+///     Some(&registry_router),
+/// ).await?;
+///
+/// println!("Mapped: {}, Unmapped: {}, Failed: {}",
+///     result.mapped_count,
+///     result.unmapped_count,
+///     result.failed_registrations);
+/// ```
+async fn process_single_dt_project(
+    db: &DynDB,
+    dt_client: &DtHttpClient,
+    dt_project: &crate::dt_types::DtProject,
+    foundation_id: &str,
+    registry_router: Option<&std::sync::Arc<RegistryRouter>>,
+) -> Result<ProcessingResult> {
+    debug!(
+        "Processing DT project: {} ({})",
+        dt_project.name, dt_project.uuid
+    );
+
+    let components = dt_client.get_project_components(&dt_project.uuid).await?;
+    debug!("Found {} components in {}", components.len(), dt_project.name);
+
+    let mut result = ProcessingResult {
+        dt_project_name: dt_project.name.clone(),
+        dt_project_uuid: dt_project.uuid.clone(),
+        registered_names: Vec::new(),
+        mapped_count: 0,
+        unmapped_count: 0,
+        failed_registrations: 0,
+        failed_unmapped_saves: 0,
+    };
+
+    for component in components {
+        // Filter components
+        if !should_process_component(&component) {
+            debug!(
+                "Skipping component {} with classifier {}",
+                component.name, component.classifier
+            );
+            continue;
+        }
+
+        // Try to find repository URL
+        match extract_repository_url_with_lookup(&component, db, registry_router).await {
+            RepositoryLookupResult::Found(repo_url) => {
+                // Build CLOMonitor project
+                match build_project_from_component(&component, &dt_project.name, repo_url) {
+                    Ok(project) => {
+                        // Immediate registration (not batched) - errors are tracked but non-fatal
+                        match register_project_if_changed(db, foundation_id, &project).await {
+                            Ok(registered) => {
+                                if registered {
+                                    debug!("Registered project: {}", project.name);
+                                } else {
+                                    debug!("Skipped registration (unchanged): {}", project.name);
+                                }
+                                result.registered_names.push(project.name.clone());
+                                result.mapped_count += 1;
+                            }
+                            Err(e) => {
+                                error!("Failed to register {}: {}", project.name, e);
+                                result.failed_registrations += 1;
+                                // Continue to next component - don't let one failure stop others
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to build project for component {}: {}", component.name, e);
+                        result.failed_registrations += 1;
+                    }
+                }
+            }
+            RepositoryLookupResult::NotFound(unmapped) => {
+                // Immediate save (not batched) - errors are tracked but non-fatal
+                match db.save_unmapped_component(foundation_id, &unmapped).await {
+                    Ok(_) => {
+                        result.unmapped_count += 1;
+                    }
+                    Err(e) => {
+                        error!("Failed to save unmapped component {}: {}", unmapped.component_name, e);
+                        result.failed_unmapped_saves += 1;
+                        // Continue to next component - don't let one failure stop others
+                    }
+                }
+            }
+        }
+    }
+
+    debug!(
+        "Completed DT project {}: {} mapped, {} unmapped",
+        dt_project.name, result.mapped_count, result.unmapped_count
+    );
+
+    Ok(result)
+}
+
+/// Register a project only if it doesn't exist or has changed (digest-based deduplication).
+///
+/// This function implements idempotent registration by comparing project digests
+/// before performing the registration. This enables efficient restarts where already-
+/// registered projects can be skipped without redundant database writes.
+///
+/// # Arguments
+///
+/// * `db` - Database connection
+/// * `foundation_id` - Foundation identifier
+/// * `project` - Project to register (must have digest set)
+///
+/// # Returns
+///
+/// * `Ok(true)` - Project was registered (new or changed)
+/// * `Ok(false)` - Project was skipped (already registered with same digest)
+/// * `Err` - Database error occurred
+///
+/// # Error Handling
+///
+/// - Database query errors propagate as `Err`
+/// - Registration errors propagate as `Err`
+/// - This function does not swallow errors - caller must handle them
+///
+/// # Examples
+///
+/// ```ignore
+/// match register_project_if_changed(&db, "foundation-id", &project).await {
+///     Ok(true) => println!("Project registered"),
+///     Ok(false) => println!("Project unchanged, skipped"),
+///     Err(e) => eprintln!("Registration failed: {}", e),
+/// }
+/// ```
+async fn register_project_if_changed(
+    db: &DynDB,
+    foundation_id: &str,
+    project: &Project,
+) -> Result<bool> {
+    // Check if project already exists with same digest
+    let existing_projects = db.foundation_projects(foundation_id).await?;
+
+    if let Some(registered_digest) = existing_projects.get(&project.name)
+        && registered_digest == &project.digest
+    {
+        // Project unchanged, skip registration
+        return Ok(false);
+    }
+
+    // Project is new or changed, register it
+    db.register_project(foundation_id, project).await?;
+    Ok(true)
+}
+
+/// Cleanup projects that are no longer present in Dependency-Track.
+///
+/// This function unregisters projects from the database that were previously registered
+/// but are no longer found in the current DT processing run. This handles the case where
+/// components are removed from DT or no longer match our filtering criteria.
+///
+/// # Arguments
+///
+/// * `db` - Database connection
+/// * `foundation_id` - Foundation identifier
+/// * `registered_in_this_run` - Set of project names that were registered in this run
+///
+/// # Returns
+///
+/// * `Ok(())` - Cleanup completed (even if some unregister operations failed)
+/// * `Err` - Database query error occurred when fetching registered projects
+///
+/// # Error Handling
+///
+/// - Query errors (getting registered projects) propagate as `Err`
+/// - Individual unregister errors are logged but don't stop cleanup
+/// - Empty `registered_in_this_run` set triggers early return (no cleanup needed)
+///
+/// # Resilience
+///
+/// This function is resilient to individual unregister failures - if one project
+/// fails to unregister, others will still be attempted. This prevents a single
+/// bad project from blocking cleanup of all removed projects.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mut registered = HashSet::new();
+/// registered.insert("project-1".to_string());
+/// registered.insert("project-2".to_string());
+///
+/// // Unregister any projects not in the set
+/// cleanup_removed_projects(&db, "foundation-id", &registered).await?;
+/// ```
+async fn cleanup_removed_projects(
+    db: &DynDB,
+    foundation_id: &str,
+    registered_in_this_run: &HashSet<String>,
+) -> Result<()> {
+    if registered_in_this_run.is_empty() {
+        debug!("No projects registered, skipping cleanup");
+        return Ok(());
+    }
+
+    let projects_registered = db.foundation_projects(foundation_id).await?;
+
+    for name in projects_registered.keys() {
+        if !registered_in_this_run.contains(name) {
+            debug!("Unregistering removed project: {}", name);
+            if let Err(err) = db.unregister_project(foundation_id, name).await {
+                error!(?err, project = name, "error unregistering");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -902,9 +1160,10 @@ mod tests {
             .await;
 
         let mut db = MockDB::new();
+        // Called once in register_project_if_changed and once in cleanup_removed_projects
         db.expect_foundation_projects()
             .with(eq("dt-test"))
-            .times(1)
+            .times(2)
             .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
 
         db.expect_register_project()
@@ -948,11 +1207,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut db = MockDB::new();
-        db.expect_foundation_projects()
-            .with(eq("dt-test"))
-            .times(1)
-            .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
+        let db = MockDB::new();
+        // No foundation_projects call expected because cleanup is skipped when no projects registered
 
         let foundation = Foundation {
             foundation_id: "dt-test".to_string(),
@@ -1001,12 +1257,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut db = MockDB::new();
-        db.expect_foundation_projects()
-            .with(eq("dt-test"))
-            .times(1)
-            .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
-
+        let db = MockDB::new();
+        // No foundation_projects call expected because cleanup is skipped when no projects registered
         // No register_project should be called since no components
 
         let foundation = Foundation {
@@ -1080,11 +1332,7 @@ mod tests {
             .times(1)
             .returning(|_, _| Box::pin(future::ready(Ok(()))));
 
-        db.expect_foundation_projects()
-            .with(eq("dt-test"))
-            .times(1)
-            .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
-
+        // No foundation_projects call expected because cleanup is skipped when no projects registered
         // No register_project should be called since component has no repo URL
 
         let foundation = Foundation {
@@ -1153,12 +1401,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mut db = MockDB::new();
-        db.expect_foundation_projects()
-            .with(eq("dt-test"))
-            .times(1)
-            .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
-
+        let db = MockDB::new();
+        // No foundation_projects call expected because cleanup is skipped when no projects registered
         // No register_project should be called since all components (CONTAINER, APPLICATION) are filtered out
 
         let foundation = Foundation {

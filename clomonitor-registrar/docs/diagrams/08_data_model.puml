@@ -1,0 +1,73 @@
+@startuml
+title Data Model - CLOMonitor Registrar
+
+entity "foundation" {
+  * foundation_id : VARCHAR(PK)
+  --
+  * data_source_type : VARCHAR
+  * data_source_config : JSONB
+}
+
+entity "project" {
+  * project_id : UUID(PK)
+  --
+  * foundation_id : VARCHAR(FK)
+  * name : VARCHAR
+  display_name : VARCHAR
+  description : TEXT
+  category : VARCHAR
+  home_url : TEXT
+  logo_url : TEXT
+  maturity : VARCHAR
+  digest : VARCHAR
+  created_at : TIMESTAMP
+  updated_at : TIMESTAMP
+}
+
+entity "repository" {
+  * repository_id : UUID(PK)
+  --
+  * project_id : UUID(FK)
+  * name : VARCHAR
+  * url : TEXT
+  check_sets : VARCHAR[]
+  digest : VARCHAR
+}
+
+entity "component_mapping" {
+  * purl : VARCHAR(PK)
+  --
+  * repo_url : TEXT
+  * source : VARCHAR
+  confidence : SMALLINT
+  created_at : TIMESTAMP
+}
+
+entity "unmapped_component" {
+  * id : SERIAL(PK)
+  --
+  * foundation_id : VARCHAR
+  * purl : VARCHAR
+  * name : VARCHAR
+  group : VARCHAR
+  version : VARCHAR
+  classifier : VARCHAR
+  created_at : TIMESTAMP
+}
+
+foundation ||--o{ project
+project ||--o{ repository
+foundation ||--o{ unmapped_component
+
+note right of component_mapping
+  Cache for purl → repo URL mappings
+  Sources: npm, maven, pypi, manual
+  Confidence: 0-100 score
+end note
+
+note right of unmapped_component
+  Tracks components that couldn't
+  be mapped to a repository URL
+end note
+
+@enduml

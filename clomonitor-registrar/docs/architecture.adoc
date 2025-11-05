@@ -1,0 +1,789 @@
+= CLOMonitor Registrar Architecture
+:toc: left
+:toclevels: 3
+:sectnums:
+:icons: font
+
+== Overview
+
+The `clomonitor-registrar` is a Rust backend component that registers projects from various data sources into the CLOMonitor PostgreSQL database. It supports two primary data sources:
+
+1. **Foundation YAML files**: Traditional YAML files served over HTTP (CNCF, LF AI & DATA, CDF)
+2. **Dependency-Track instances**: Fetches components from DT API and maps them to CLOMonitor projects
+
+== C4 Model Diagrams
+
+=== Level 1: System Context Diagram
+
+The context diagram shows how the CLOMonitor Registrar fits within the larger ecosystem.
+
+[plantuml, c4-context, svg]
+....
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+LAYOUT_WITH_LEGEND()
+
+title System Context Diagram - CLOMonitor Registrar
+
+Person(admin, "System Administrator", "Configures and monitors the registrar")
+
+System(registrar, "CLOMonitor Registrar", "Fetches project data from multiple sources and registers them in the database for health monitoring")
+
+System_Ext(yaml_files, "Foundation YAML Files", "YAML files hosted by CNCF, LF AI, CDF containing project metadata")
+System_Ext(dependency_track, "Dependency-Track", "OWASP Dependency-Track instances containing component/library information")
+System_Ext(npm_registry, "npm Registry", "Public npm registry for package metadata lookups")
+System_Ext(maven_registry, "Maven Central", "Maven Central repository for Java package metadata")
+System_Ext(pypi_registry, "PyPI Registry", "Python Package Index for Python package metadata")
+
+SystemDb(database, "PostgreSQL Database", "Stores foundation, project, and repository data")
+
+System(tracker, "CLOMonitor Tracker", "Analyzes registered repositories for health metrics")
+System(api, "CLOMonitor API Server", "Serves project data via HTTP API")
+
+Rel(admin, registrar, "Configures and runs", "YAML config")
+Rel(registrar, yaml_files, "Fetches project lists", "HTTPS")
+Rel(registrar, dependency_track, "Fetches components", "HTTPS/REST API")
+Rel(registrar, npm_registry, "Looks up repository URLs", "HTTPS")
+Rel(registrar, maven_registry, "Looks up repository URLs", "HTTPS")
+Rel(registrar, pypi_registry, "Looks up repository URLs", "HTTPS")
+Rel(registrar, database, "Registers/unregisters projects", "PostgreSQL/TLS")
+Rel(tracker, database, "Reads projects to analyze", "PostgreSQL/TLS")
+Rel(api, database, "Reads project data", "PostgreSQL/TLS")
+
+@enduml
+....
+
+=== Level 2: Container Diagram
+
+The container diagram shows the main runtime containers and their interactions.
+
+[plantuml, c4-container, svg]
+....
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Container Diagram - CLOMonitor Registrar
+
+Person(admin, "Administrator", "Runs and monitors registrar")
+
+System_Boundary(registrar_system, "CLOMonitor Registrar System") {
+    Container(registrar_app, "Registrar Application", "Rust/Tokio", "Async process that fetches and registers project data")
+    ContainerDb(cache, "In-Memory Cache", "HashMap", "Caches component URL mappings during execution")
+}
+
+System_Ext(yaml_source, "Foundation YAML", "HTTPS")
+System_Ext(dt_api, "Dependency-Track API", "REST API")
+System_Ext(registry_apis, "Package Registries", "npm, Maven, PyPI")
+
+ContainerDb(postgres, "PostgreSQL Database", "PostgreSQL 14+", "Stores foundations, projects, repositories, component mappings")
+
+Rel(admin, registrar_app, "Runs", "CLI with config file")
+Rel(registrar_app, yaml_source, "Fetches YAML", "HTTPS GET")
+Rel(registrar_app, dt_api, "Fetches projects & components", "HTTPS GET with X-Api-Key")
+Rel(registrar_app, registry_apis, "Looks up repo URLs", "HTTPS GET")
+Rel(registrar_app, cache, "Reads/writes mappings", "In-process")
+Rel(registrar_app, postgres, "Calls database functions", "PostgreSQL/TLS")
+Rel_Back(postgres, registrar_app, "Returns foundation & project data", "SQL results")
+
+note right of registrar_app
+  Concurrent processing with:
+  - Configurable concurrency level
+  - 300s timeout per foundation
+  - Retry logic for rate limits
+end note
+
+@enduml
+....
+
+=== Level 3: Component Diagram
+
+The component diagram shows the internal structure of the registrar application.
+
+[plantuml, c4-component, svg]
+....
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - CLOMonitor Registrar
+
+Container_Boundary(registrar, "Registrar Application") {
+    Component(main, "Main Entry Point", "main.rs", "Handles CLI args, config loading, database setup, and launches registrar")
+    Component(registrar_core, "Registrar Core", "registrar.rs", "Orchestrates foundation processing with concurrency control")
+
+    Component(db_layer, "Database Layer", "db.rs", "PostgreSQL trait and implementation with connection pool")
+
+    Component_Ext(dt_client, "DT Client", "dt_client.rs", "HTTP client for Dependency-Track API with pagination & retry logic")
+    Component_Ext(dt_mapper, "DT Mapper", "dt_mapper.rs", "Maps DT components to CLOMonitor projects, extracts repo URLs")
+    Component_Ext(dt_types, "DT Types", "dt_types.rs", "Data structures for DT API responses")
+
+    Component_Ext(registry_router, "Registry Router", "registry_apis/mod.rs", "Routes purl lookups to appropriate registry API")
+    Component_Ext(npm_client, "npm Client", "registry_apis/npm.rs", "Fetches npm package metadata")
+    Component_Ext(maven_client, "Maven Client", "registry_apis/maven.rs", "Fetches Maven package metadata")
+    Component_Ext(pypi_client, "PyPI Client", "registry_apis/pypi.rs", "Fetches PyPI package metadata")
+}
+
+ContainerDb(postgres, "PostgreSQL", "Database")
+System_Ext(dt_api, "DT API", "External")
+System_Ext(yaml_files, "YAML Files", "External")
+System_Ext(registries, "Package Registries", "External")
+
+Rel(main, registrar_core, "Calls run()", "async")
+Rel(main, db_layer, "Creates DB pool", "TLS connection")
+
+Rel(registrar_core, db_layer, "Uses", "trait calls")
+Rel(registrar_core, dt_client, "Uses", "for DT foundations")
+Rel(registrar_core, dt_mapper, "Uses", "to convert components")
+Rel(registrar_core, registry_router, "Uses", "for purl lookups")
+
+Rel(dt_mapper, dt_types, "Uses", "data structures")
+Rel(dt_mapper, registry_router, "Calls", "for missing URLs")
+Rel(dt_client, dt_types, "Returns", "DT responses")
+
+Rel(registry_router, npm_client, "Routes npm purls", "")
+Rel(registry_router, maven_client, "Routes maven purls", "")
+Rel(registry_router, pypi_client, "Routes pypi purls", "")
+
+Rel(dt_client, dt_api, "GET requests", "HTTPS")
+Rel(registrar_core, yaml_files, "GET requests", "HTTPS")
+Rel(npm_client, registries, "npm API", "HTTPS")
+Rel(maven_client, registries, "Maven API", "HTTPS")
+Rel(pypi_client, registries, "PyPI API", "HTTPS")
+
+Rel(db_layer, postgres, "Executes functions", "SQL")
+
+note right of registrar_core
+  Processing modes:
+  - YAML: Fetch → Parse → Register
+  - DT: Fetch projects → Fetch components
+    → Map → Lookup URLs → Register
+end note
+
+note right of dt_mapper
+  URL extraction priority:
+  1. externalReferences (vcs)
+  2. purl (GitHub/GitLab)
+  3. Registry API lookup
+  4. Database cache
+end note
+
+@enduml
+....
+
+== Runtime Views
+
+=== Sequence Diagram: YAML Foundation Processing
+
+[plantuml, runtime-yaml, svg]
+....
+@startuml
+title Runtime View - YAML Foundation Processing
+
+actor Admin
+participant "Main" as main
+participant "Registrar" as reg
+participant "DB Layer" as db
+participant "HTTP Client" as http
+participant "YAML File" as yaml
+database "PostgreSQL" as pg
+
+Admin -> main: Run with config
+activate main
+
+main -> main: Load config from YAML
+main -> main: Setup logging
+main -> main: Setup DB pool with TLS
+main -> reg: run(config, db)
+activate reg
+
+reg -> db: foundations()
+activate db
+db -> pg: SELECT foundation_id, \ndata_source_type, data_source_config
+pg --> db: Foundation rows
+db --> reg: Vec<Foundation>
+deactivate db
+
+loop For each foundation (concurrent, configurable limit)
+    reg -> reg: Timeout(300s)
+
+    alt data_source == YamlUrl
+        reg -> http: GET data_url
+        activate http
+        http -> yaml: HTTPS GET
+        yaml --> http: YAML content
+        http --> reg: Response body
+        deactivate http
+
+        reg -> reg: Parse YAML to Vec<Project>
+        reg -> reg: Filter excluded repos
+        reg -> reg: Calculate digests
+
+        reg -> db: foundation_projects(foundation_id)
+        activate db
+        db -> pg: SELECT project_name, digest
+        pg --> db: Existing projects
+        db --> reg: HashMap<name, digest>
+        deactivate db
+
+        loop For each project
+            alt New or digest changed
+                reg -> db: register_project(foundation_id, project)
+                activate db
+                db -> pg: SELECT register_project($1::text, $2::jsonb)
+                pg --> db: Success
+                db --> reg: Ok()
+                deactivate db
+            end
+        end
+
+        loop For each existing project not in YAML
+            reg -> db: unregister_project(foundation_id, name)
+            activate db
+            db -> pg: SELECT unregister_project($1::text, $2::text)
+            pg --> db: Success
+            db --> reg: Ok()
+            deactivate db
+        end
+    end
+end
+
+reg --> main: Ok()
+deactivate reg
+main --> Admin: Exit
+deactivate main
+
+@enduml
+....
+
+=== Sequence Diagram: Dependency-Track Foundation Processing
+
+[plantuml, runtime-dt, svg]
+....
+@startuml
+title Runtime View - Dependency-Track Foundation Processing
+
+participant "Registrar" as reg
+participant "DT Client" as dt_client
+participant "DT Mapper" as mapper
+participant "Registry Router" as router
+participant "npm Client" as npm
+participant "DB Layer" as db
+participant "DT API" as dt_api
+participant "npm Registry" as npm_api
+database "PostgreSQL" as pg
+
+reg -> dt_client: get_projects()
+activate dt_client
+
+loop Pagination (page 1, 2, 3...)
+    dt_client -> dt_api: GET /api/v1/project\n?pageNumber=N&pageSize=100\nX-Api-Key: xxx
+    dt_api --> dt_client: [DtProject] + X-Total-Count
+
+    alt Status 429 (Rate Limited)
+        dt_client -> dt_client: Sleep with exponential backoff
+        dt_client -> dt_api: Retry GET request
+    end
+end
+
+dt_client --> reg: Vec<DtProject>
+deactivate dt_client
+
+loop For each DT project
+    reg -> dt_client: get_project_components(project_uuid)
+    activate dt_client
+
+    loop Pagination
+        dt_client -> dt_api: GET /api/v1/component/project/{uuid}\n?pageNumber=N&pageSize=100
+        dt_api --> dt_client: [DtComponent] + X-Total-Count
+    end
+
+    dt_client --> reg: Vec<DtComponent>
+    deactivate dt_client
+
+    loop For each component
+        reg -> mapper: should_process_component(component)
+        activate mapper
+        mapper --> reg: bool (LIBRARY or FRAMEWORK)
+        deactivate mapper
+
+        alt Should process
+            reg -> mapper: extract_repository_url_with_lookup(\ncomponent, registry_router, db)
+            activate mapper
+
+            alt Has externalReferences[vcs]
+                mapper --> reg: Some(repo_url)
+            else purl is GitHub/GitLab
+                mapper -> mapper: extract_url_from_purl()
+                mapper --> reg: Some(repo_url)
+            else Check database cache
+                mapper -> db: get_component_mapping(purl)
+                activate db
+                db -> pg: SELECT repo_url FROM component_mapping\nWHERE purl = $1
+                pg --> db: repo_url or NULL
+                db --> mapper: Option<String>
+                deactivate db
+
+                alt Cache hit
+                    mapper --> reg: Some(cached_url)
+                else Cache miss & registry enabled
+                    mapper -> router: lookup_repository_url(purl)
+                    activate router
+
+                    router -> router: Parse purl type
+
+                    alt purl type = npm
+                        router -> npm: get_repository_url(package_name)
+                        activate npm
+                        npm -> npm_api: GET /{package_name}
+                        npm_api --> npm: Package metadata JSON
+                        npm -> npm: Extract repository.url
+                        npm --> router: Option<String>
+                        deactivate npm
+                    end
+
+                    router --> mapper: Option<String>
+                    deactivate router
+
+                    alt Lookup successful
+                        mapper -> db: save_component_mapping(\npurl, repo_url, "npm", confidence)
+                        activate db
+                        db -> pg: INSERT INTO component_mapping
+                        db --> mapper: Ok()
+                        deactivate db
+                        mapper --> reg: Some(repo_url)
+                    else Lookup failed
+                        mapper -> db: save_unmapped_component(\nfoundation_id, component)
+                        activate db
+                        db -> pg: INSERT INTO unmapped_component
+                        db --> mapper: Ok()
+                        deactivate db
+                        mapper --> reg: None
+                    end
+                end
+            end
+            deactivate mapper
+
+            alt repo_url found
+                reg -> mapper: convert_component_to_project(\ncomponent, dt_project_name)
+                activate mapper
+                mapper -> mapper: Format names (name, display_name)
+                mapper -> mapper: Create Repository struct
+                mapper -> mapper: Create Project struct
+                mapper -> mapper: Calculate digest
+                mapper --> reg: Result<Project>
+                deactivate mapper
+
+                reg -> reg: Add to all_projects_to_register
+            end
+        end
+    end
+end
+
+reg -> db: foundation_projects(foundation_id)
+activate db
+db -> pg: SELECT project_name, digest
+pg --> db: Existing projects
+db --> reg: HashMap<name, digest>
+deactivate db
+
+loop For each project to register
+    alt New or changed
+        reg -> db: register_project(foundation_id, project)
+        activate db
+        db -> pg: SELECT register_project($1::text, $2::jsonb)
+        pg --> db: Success
+        db --> reg: Ok()
+        deactivate db
+    end
+end
+
+loop For each removed project
+    reg -> db: unregister_project(foundation_id, name)
+    activate db
+    db -> pg: SELECT unregister_project($1::text, $2::text)
+    pg --> db: Success
+    db --> reg: Ok()
+    deactivate db
+end
+
+@enduml
+....
+
+=== Activity Diagram: Component URL Resolution Strategy
+
+[plantuml, activity-url-resolution, svg]
+....
+@startuml
+title Activity Diagram - Component Repository URL Resolution
+
+start
+
+:Receive DtComponent;
+
+if (Has externalReferences?) then (yes)
+  :Iterate through externalReferences;
+  if (Found type="vcs"?) then (yes)
+    :Extract URL from vcs reference;
+    :Normalize URL (remove .git, trailing slash);
+    stop
+  endif
+endif
+
+:Check purl field;
+
+if (purl starts with "pkg:github/"?) then (yes)
+  :Extract "pkg:github/owner/repo@version";
+  :Build "https://github.com/owner/repo";
+  stop
+elseif (purl starts with "pkg:gitlab/"?) then (yes)
+  :Extract "pkg:gitlab/owner/repo@version";
+  :Build "https://gitlab.com/owner/repo";
+  stop
+endif
+
+:Query database cache;
+:SELECT repo_url FROM component_mapping\nWHERE purl = ?;
+
+if (Cache hit?) then (yes)
+  :Return cached repo_url;
+  stop
+endif
+
+if (Registry API lookup enabled?) then (yes)
+  :Parse purl type (npm, maven, pypi);
+
+  if (Type is npm?) then (yes)
+    :Call npm registry API;
+    :Parse repository.url from package.json;
+  elseif (Type is maven?) then (yes)
+    :Call Maven Central API;
+    :Parse SCM URL from POM;
+  elseif (Type is pypi?) then (yes)
+    :Call PyPI JSON API;
+    :Parse project_urls or home_page;
+  else (unknown)
+    :No lookup available;
+  endif
+
+  if (Lookup successful?) then (yes)
+    :Save to component_mapping table;
+    :Return resolved URL;
+    stop
+  else (failed)
+    :Save to unmapped_component table;
+    :Log: Component skipped, no URL found;
+    stop
+  endif
+else (disabled)
+  :Save to unmapped_component table;
+  :Log: Component skipped, no URL found;
+  stop
+endif
+
+@enduml
+....
+
+=== Deployment Diagram
+
+[plantuml, deployment, svg]
+....
+@startuml
+title Deployment Diagram - CLOMonitor Registrar
+
+node "Application Server" {
+    component "clomonitor-registrar" as registrar
+    note right of registrar
+      Runtime: Tokio async runtime
+      Config: YAML file
+      Environment: RUST_LOG=debug
+    end note
+}
+
+node "Database Server" {
+    database "PostgreSQL 14+" as db
+    note right of db
+      Tables:
+      - foundation
+      - project
+      - repository
+      - component_mapping
+      - unmapped_component
+    end note
+}
+
+cloud "Internet" {
+    component "Foundation YAML Files" as yaml
+    component "Dependency-Track API" as dt
+    component "npm Registry" as npm
+    component "Maven Central" as maven
+    component "PyPI" as pypi
+}
+
+registrar -down-> db : PostgreSQL/TLS\n(port 5432)
+registrar -up-> yaml : HTTPS
+registrar -up-> dt : HTTPS + X-Api-Key
+registrar -up-> npm : HTTPS
+registrar -up-> maven : HTTPS
+registrar -up-> pypi : HTTPS
+
+note right of registrar
+  Execution modes:
+  1. Cron job (periodic)
+  2. Manual execution
+  3. Docker container
+end note
+
+@enduml
+....
+
+== Data Model
+
+=== Database Schema
+
+[plantuml, data-model, svg]
+....
+@startuml
+title Data Model - CLOMonitor Registrar
+
+entity "foundation" {
+  * foundation_id : VARCHAR(PK)
+  --
+  * data_source_type : VARCHAR
+  * data_source_config : JSONB
+}
+
+entity "project" {
+  * project_id : UUID(PK)
+  --
+  * foundation_id : VARCHAR(FK)
+  * name : VARCHAR
+  display_name : VARCHAR
+  description : TEXT
+  category : VARCHAR
+  home_url : TEXT
+  logo_url : TEXT
+  maturity : VARCHAR
+  digest : VARCHAR
+  created_at : TIMESTAMP
+  updated_at : TIMESTAMP
+}
+
+entity "repository" {
+  * repository_id : UUID(PK)
+  --
+  * project_id : UUID(FK)
+  * name : VARCHAR
+  * url : TEXT
+  check_sets : VARCHAR[]
+  digest : VARCHAR
+}
+
+entity "component_mapping" {
+  * purl : VARCHAR(PK)
+  --
+  * repo_url : TEXT
+  * source : VARCHAR
+  confidence : SMALLINT
+  created_at : TIMESTAMP
+}
+
+entity "unmapped_component" {
+  * id : SERIAL(PK)
+  --
+  * foundation_id : VARCHAR
+  * purl : VARCHAR
+  * name : VARCHAR
+  group : VARCHAR
+  version : VARCHAR
+  classifier : VARCHAR
+  created_at : TIMESTAMP
+}
+
+foundation ||--o{ project
+project ||--o{ repository
+foundation ||--o{ unmapped_component
+
+note right of component_mapping
+  Cache for purl → repo URL mappings
+  Sources: npm, maven, pypi, manual
+  Confidence: 0-100 score
+end note
+
+note right of unmapped_component
+  Tracks components that couldn't
+  be mapped to a repository URL
+end note
+
+@enduml
+....
+
+== Configuration
+
+=== Configuration Structure
+
+[source,yaml]
+----
+# Database connection
+db:
+  host: localhost
+  port: "5432"
+  dbname: clomonitor
+  user: postgres
+  password: ""
+
+# Registrar settings
+registrar:
+  concurrency: 2  # Max concurrent foundations
+
+# Registry API lookups (optional)
+registry_api:
+  enabled: true
+  npm_enabled: true
+  maven_enabled: true
+  pypi_enabled: true
+
+# Logging
+log:
+  format: "json"  # or "text"
+----
+
+=== Foundation Data Source Examples
+
+==== YAML Data Source
+
+[source,sql]
+----
+INSERT INTO foundation (foundation_id, data_source_type, data_source_config)
+VALUES (
+  'cncf',
+  'yaml_url',
+  '{"data_url": "https://raw.githubusercontent.com/cncf/landscape/master/data.yaml"}'::jsonb
+);
+----
+
+==== Dependency-Track Data Source
+
+[source,sql]
+----
+INSERT INTO foundation (foundation_id, data_source_type, data_source_config)
+VALUES (
+  'my-dt-instance',
+  'dependency_track',
+  '{
+    "dt_url": "https://dtrack.example.com",
+    "dt_api_key": "your-api-key-here"
+  }'::jsonb
+);
+----
+
+== Design Decisions
+
+=== ADR-001: Support Multiple Data Sources
+
+*Status*: Accepted
+
+*Context*: Originally supported only YAML files. Need to support Dependency-Track instances.
+
+*Decision*: Use enum-based polymorphism with `DataSource` enum to support both YAML and DT sources.
+
+*Consequences*:
+- Foundation table schema extended with `data_source_type` and `data_source_config`
+- Backward compatible with existing YAML foundations
+- Easy to add new source types in the future
+
+=== ADR-002: Component URL Resolution Strategy
+
+*Status*: Accepted
+
+*Context*: DT components may not have repository URLs. Need fallback strategy.
+
+*Decision*: Multi-tier resolution:
+1. externalReferences (vcs type)
+2. Extract from purl (GitHub/GitLab)
+3. Database cache lookup
+4. Registry API lookup (npm, Maven, PyPI)
+5. Save as unmapped
+
+*Consequences*:
+- Maximizes successful mappings
+- Caching reduces API calls
+- Unmapped components tracked for visibility
+
+=== ADR-003: Registry API Lookup Integration
+
+*Status*: Accepted
+
+*Context*: Many components only have purl, not repository URLs.
+
+*Decision*: Integrate with package registry APIs (npm, Maven Central, PyPI) to resolve repository URLs.
+
+*Consequences*:
+- Increases mapping success rate
+- Adds external dependencies
+- Requires rate limiting and caching
+- Configurable to disable if needed
+
+== Performance Considerations
+
+=== Concurrency Model
+
+- Uses Tokio async runtime
+- Configurable concurrency limit for foundation processing
+- 300-second timeout per foundation
+- Concurrent HTTP requests with connection pooling
+
+=== Scalability
+
+- Database connection pooling (deadpool-postgres)
+- Component mapping cache reduces duplicate lookups
+- Registry API responses cached in database
+- Pagination for large DT projects (100 items/page)
+
+=== Error Handling
+
+- Retry logic for rate-limited requests (HTTP 429)
+- Exponential backoff for retries
+- Continue processing on individual component failures
+- Comprehensive logging for debugging
+
+== Security Considerations
+
+- TLS required for database connections
+- API keys stored in database (foundation config)
+- No plaintext credential storage in config files
+- Input validation on external data (YAML, JSON)
+- SQL injection prevention (parameterized queries)
+
+== Monitoring and Observability
+
+=== Logging
+
+- Structured logging with `tracing` crate
+- Configurable log levels via `RUST_LOG`
+- JSON format support for log aggregation
+- Per-foundation instrumentation
+
+=== Metrics
+
+Key metrics to track:
+- Foundation processing duration
+- Number of projects registered/unregistered
+- Component mapping success/failure rates
+- Registry API call counts
+- Database operation latencies
+
+== Future Enhancements
+
+=== Potential Improvements
+
+1. **GraphQL API Support**: Add support for GraphQL-based data sources
+2. **Webhook Integration**: Support real-time updates via webhooks
+3. **Multi-region DT**: Support multiple DT instances per foundation
+4. **Component Deduplication**: Detect and merge duplicate components across projects
+5. **Machine Learning**: Use ML to improve URL extraction confidence scores
+6. **Incremental Updates**: Support incremental syncs instead of full scans
+

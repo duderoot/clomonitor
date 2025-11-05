@@ -1,0 +1,68 @@
+@startuml
+title Activity Diagram - Component Repository URL Resolution Strategy
+
+start
+
+:Receive DtComponent;
+
+if (Has externalReferences?) then (yes)
+  :Iterate through externalReferences;
+  if (Found type="vcs"?) then (yes)
+    :Extract URL from vcs reference;
+    :Normalize URL (remove .git, trailing slash);
+    stop
+  endif
+endif
+
+:Check purl field;
+
+if (purl starts with "pkg:github/"?) then (yes)
+  :Extract "pkg:github/owner/repo@version";
+  :Build "https://github.com/owner/repo";
+  stop
+elseif (purl starts with "pkg:gitlab/"?) then (yes)
+  :Extract "pkg:gitlab/owner/repo@version";
+  :Build "https://gitlab.com/owner/repo";
+  stop
+endif
+
+:Query database cache;
+:SELECT repo_url FROM component_mapping\nWHERE purl = ?;
+
+if (Cache hit?) then (yes)
+  :Return cached repo_url;
+  stop
+endif
+
+if (Registry API lookup enabled?) then (yes)
+  :Parse purl type (npm, maven, pypi);
+
+  if (Type is npm?) then (yes)
+    :Call npm registry API;
+    :Parse repository.url from package.json;
+  elseif (Type is maven?) then (yes)
+    :Call Maven Central API;
+    :Parse SCM URL from POM;
+  elseif (Type is pypi?) then (yes)
+    :Call PyPI JSON API;
+    :Parse project_urls or home_page;
+  else (unknown)
+    :No lookup available;
+  endif
+
+  if (Lookup successful?) then (yes)
+    :Save to component_mapping table;
+    :Return resolved URL;
+    stop
+  else (failed)
+    :Save to unmapped_component table;
+    :Log: Component skipped, no URL found;
+    stop
+  endif
+else (disabled)
+  :Save to unmapped_component table;
+  :Log: Component skipped, no URL found;
+  stop
+endif
+
+@enduml

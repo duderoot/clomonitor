@@ -1,0 +1,68 @@
+@startuml
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Component Diagram - CLOMonitor Registrar
+
+Container_Boundary(registrar, "Registrar Application") {
+    Component(main, "Main Entry Point", "main.rs", "Handles CLI args, config loading, database setup, and launches registrar")
+    Component(registrar_core, "Registrar Core", "registrar.rs", "Orchestrates foundation processing with concurrency control")
+
+    Component(db_layer, "Database Layer", "db.rs", "PostgreSQL trait and implementation with connection pool")
+
+    Component_Ext(dt_client, "DT Client", "dt_client.rs", "HTTP client for Dependency-Track API with pagination & retry logic")
+    Component_Ext(dt_mapper, "DT Mapper", "dt_mapper.rs", "Maps DT components to CLOMonitor projects, extracts repo URLs")
+    Component_Ext(dt_types, "DT Types", "dt_types.rs", "Data structures for DT API responses")
+
+    Component_Ext(registry_router, "Registry Router", "registry_apis/mod.rs", "Routes purl lookups to appropriate registry API")
+    Component_Ext(npm_client, "npm Client", "registry_apis/npm.rs", "Fetches npm package metadata")
+    Component_Ext(maven_client, "Maven Client", "registry_apis/maven.rs", "Fetches Maven package metadata")
+    Component_Ext(pypi_client, "PyPI Client", "registry_apis/pypi.rs", "Fetches PyPI package metadata")
+}
+
+ContainerDb(postgres, "PostgreSQL", "Database")
+System_Ext(dt_api, "DT API", "External")
+System_Ext(yaml_files, "YAML Files", "External")
+System_Ext(registries, "Package Registries", "External")
+
+Rel(main, registrar_core, "Calls run()", "async")
+Rel(main, db_layer, "Creates DB pool", "TLS connection")
+
+Rel(registrar_core, db_layer, "Uses", "trait calls")
+Rel(registrar_core, dt_client, "Uses", "for DT foundations")
+Rel(registrar_core, dt_mapper, "Uses", "to convert components")
+Rel(registrar_core, registry_router, "Uses", "for purl lookups")
+
+Rel(dt_mapper, dt_types, "Uses", "data structures")
+Rel(dt_mapper, registry_router, "Calls", "for missing URLs")
+Rel(dt_client, dt_types, "Returns", "DT responses")
+
+Rel(registry_router, npm_client, "Routes npm purls", "")
+Rel(registry_router, maven_client, "Routes maven purls", "")
+Rel(registry_router, pypi_client, "Routes pypi purls", "")
+
+Rel(dt_client, dt_api, "GET requests", "HTTPS")
+Rel(registrar_core, yaml_files, "GET requests", "HTTPS")
+Rel(npm_client, registries, "npm API", "HTTPS")
+Rel(maven_client, registries, "Maven API", "HTTPS")
+Rel(pypi_client, registries, "PyPI API", "HTTPS")
+
+Rel(db_layer, postgres, "Executes functions", "SQL")
+
+note right of registrar_core
+  Processing modes:
+  - YAML: Fetch → Parse → Register
+  - DT: Fetch projects → Fetch components
+    → Map → Lookup URLs → Register
+end note
+
+note right of dt_mapper
+  URL extraction priority:
+  1. externalReferences (vcs)
+  2. purl (GitHub/GitLab)
+  3. Registry API lookup
+  4. Database cache
+end note
+
+@enduml
