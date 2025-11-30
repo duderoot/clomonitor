@@ -47,14 +47,14 @@ This directory contains comprehensive pgTap tests for the DT (Dependency-Track) 
 ### Run All DT Tests
 
 ```bash
-cd /Users/duderoot/git/research/foss/clomonitor/database/tests
+cd clomonitor/database/tests
 pg_prove --host localhost --dbname clomonitor_tests --username postgres --verbose functions/dt/*.sql
 ```
 
 ### Run Individual Test File
 
 ```bash
-cd /Users/duderoot/git/research/foss/clomonitor/database/tests
+cd clomonitor/database/tests
 
 # Test record_dt_import function
 pg_prove --host localhost --dbname clomonitor_tests --username postgres --verbose functions/dt/record_dt_import.sql
@@ -86,7 +86,7 @@ createdb -U postgres clomonitor_tests
 psql -U postgres -d clomonitor_tests -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
 
 # Apply migrations (from database/migrations directory)
-cd /Users/duderoot/git/research/foss/clomonitor/database/migrations
+cd clomonitor/database/migrations
 TERN_CONF=~/.config/clomonitor/tern.conf ./migrate.sh
 ```
 
@@ -223,9 +223,9 @@ When modifying DT functions:
 
 ## Related Documentation
 
-- Function implementations: `/Users/duderoot/git/research/foss/clomonitor/database/migrations/functions/dt/`
-- Schema migrations: `/Users/duderoot/git/research/foss/clomonitor/database/migrations/schema/`
-- DT integration docs: `/Users/duderoot/git/research/foss/clomonitor/DT_VISIBILITY_IMPLEMENTATION_TRACKER.md`
+- Function implementations: `clomonitor/database/migrations/functions/dt/`
+- Schema migrations: `clomonitor/database/migrations/schema/`
+- DT integration docs: `clomonitor/DT_VISIBILITY_IMPLEMENTATION_TRACKER.md`
 
 ## Contact
 
