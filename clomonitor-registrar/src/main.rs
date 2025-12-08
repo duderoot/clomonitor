@@ -18,8 +18,9 @@ mod db;
 mod dt_client;
 mod dt_mapper;
 mod dt_types;
-mod registry_apis;
+mod importer_client;
 mod registrar;
+mod registry_apis;
 
 #[derive(Debug, Parser)]
 #[clap(author, version, about)]

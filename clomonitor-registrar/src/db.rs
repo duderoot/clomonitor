@@ -1,13 +1,15 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::{format_err, Result};
+use anyhow::{Result, format_err};
 use async_trait::async_trait;
 use deadpool_postgres::Pool;
 #[cfg(test)]
 use mockall::automock;
 use tokio_postgres::types::Json;
 
-use crate::registrar::{DataSource, DtConfig, Foundation, Project, UnmappedComponent};
+use crate::registrar::{
+    DataSource, DtConfig, Foundation, ImporterApiConfig, Project, UnmappedComponent,
+};
 
 /// Type alias to represent a DB trait object.
 pub(crate) type DynDB = Arc<dyn DB + Send + Sync>;
@@ -92,11 +94,16 @@ impl DB for PgDB {
                         let dt_config: DtConfig = serde_json::from_value(data_source_config)?;
                         DataSource::DependencyTrack(dt_config)
                     }
+                    "importer_api" => {
+                        let importer_config: ImporterApiConfig =
+                            serde_json::from_value(data_source_config)?;
+                        DataSource::ImporterApi(importer_config)
+                    }
                     _ => {
                         return Err(format_err!(
                             "Unknown data source type: {}",
                             data_source_type
-                        ))
+                        ));
                     }
                 };
 

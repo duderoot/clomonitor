@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use reqwest::StatusCode;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::debug;
 
 use crate::dt_types::{DtComponent, DtProject};
@@ -228,7 +228,10 @@ mod tests {
         // First page
         let mock1 = server
             .mock("GET", "/api/v1/project")
-            .match_query(mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()))
+            .match_query(mockito::Matcher::UrlEncoded(
+                "pageNumber".into(),
+                "1".into(),
+            ))
             .with_status(200)
             .with_header("X-Total-Count", "2")
             .with_body(r#"[{"uuid":"1","name":"proj1"}]"#)
@@ -238,7 +241,10 @@ mod tests {
         // Second page
         let mock2 = server
             .mock("GET", "/api/v1/project")
-            .match_query(mockito::Matcher::UrlEncoded("pageNumber".into(), "2".into()))
+            .match_query(mockito::Matcher::UrlEncoded(
+                "pageNumber".into(),
+                "2".into(),
+            ))
             .with_status(200)
             .with_header("X-Total-Count", "2")
             .with_body(r#"[{"uuid":"2","name":"proj2"}]"#)
@@ -271,7 +277,11 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         // Check that error contains status code or error info
-        assert!(err_msg.contains("API error") || err_msg.contains("status="), "Error message was: {}", err_msg);
+        assert!(
+            err_msg.contains("API error") || err_msg.contains("status="),
+            "Error message was: {}",
+            err_msg
+        );
     }
 
     #[tokio::test]
@@ -280,7 +290,10 @@ mod tests {
         let project_uuid = "proj-123";
 
         let mock = server
-            .mock("GET", format!("/api/v1/component/project/{}", project_uuid).as_str())
+            .mock(
+                "GET",
+                format!("/api/v1/component/project/{}", project_uuid).as_str(),
+            )
             .match_header("X-Api-Key", "test-key")
             .match_query(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::UrlEncoded("pageNumber".into(), "1".into()),

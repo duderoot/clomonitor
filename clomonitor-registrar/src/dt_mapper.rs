@@ -1,9 +1,9 @@
-use anyhow::{format_err, Result};
+use anyhow::{Result, format_err};
 use std::sync::Arc;
 
 use crate::db::DynDB;
 use crate::dt_types::DtComponent;
-use crate::registrar::{Project, Repository, UnmappedComponent, RepositoryLookupResult};
+use crate::registrar::{Project, Repository, RepositoryLookupResult, UnmappedComponent};
 use crate::registry_apis::RegistryRouter;
 
 #[cfg(test)]
@@ -31,7 +31,9 @@ pub(crate) async fn extract_repository_url_with_lookup(
     if let Some(repo_url) = extract_repository_url(component) {
         // Optionally save to mapping table with 'auto' source
         if let Some(purl) = &component.purl {
-            let _ = db.save_component_mapping(purl, &repo_url, "auto", Some(80)).await;
+            let _ = db
+                .save_component_mapping(purl, &repo_url, "auto", Some(80))
+                .await;
         }
         return RepositoryLookupResult::Found(repo_url);
     }
@@ -40,7 +42,9 @@ pub(crate) async fn extract_repository_url_with_lookup(
     if let (Some(router), Some(purl)) = (registry_router, &component.purl) {
         if let Ok(Some(repo_url)) = router.lookup(purl).await {
             // Save to mapping table with 'registry_api' source
-            let _ = db.save_component_mapping(purl, &repo_url, "registry_api", Some(70)).await;
+            let _ = db
+                .save_component_mapping(purl, &repo_url, "registry_api", Some(70))
+                .await;
             return RepositoryLookupResult::Found(repo_url);
         }
     }
@@ -139,7 +143,8 @@ fn clean_github_url(url: &str) -> String {
                 || third_part == "blob"
                 || third_part == "modules"
                 || third_part == "packages"
-                || !third_part.contains('.') // Likely a submodule/subpath
+                || !third_part.contains('.')
+            // Likely a submodule/subpath
             {
                 return format!("https://github.com/{}/{}", parts[0], parts[1]);
             }
@@ -175,19 +180,13 @@ fn extract_url_from_purl(purl: &str) -> Option<String> {
 
     // Handle GitHub purls: pkg:github/owner/repo@version
     if purl.starts_with("pkg:github/") {
-        let parts: Vec<&str> = purl
-            .trim_start_matches("pkg:github/")
-            .split('@')
-            .collect();
+        let parts: Vec<&str> = purl.trim_start_matches("pkg:github/").split('@').collect();
         return Some(format!("https://github.com/{}", parts[0]));
     }
 
     // Handle GitLab purls
     if purl.starts_with("pkg:gitlab/") {
-        let parts: Vec<&str> = purl
-            .trim_start_matches("pkg:gitlab/")
-            .split('@')
-            .collect();
+        let parts: Vec<&str> = purl.trim_start_matches("pkg:gitlab/").split('@').collect();
         return Some(format!("https://gitlab.com/{}", parts[0]));
     }
 
@@ -395,7 +394,9 @@ mod tests {
 
         // Test http to https conversion
         assert_eq!(
-            normalize_git_url("http://github.com/FasterXML/jackson-modules-java8/jackson-module-parameter-names"),
+            normalize_git_url(
+                "http://github.com/FasterXML/jackson-modules-java8/jackson-module-parameter-names"
+            ),
             "https://github.com/FasterXML/jackson-modules-java8"
         );
     }
@@ -477,10 +478,12 @@ mod tests {
 
         let result = convert_component_to_project(&dt_component, "my-app");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No repository URL"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No repository URL")
+        );
     }
 
     #[test]
@@ -535,7 +538,9 @@ mod tests {
             .expect_get_component_mapping()
             .with(mockall::predicate::eq("pkg:npm/express@4.18.2"))
             .times(1)
-            .returning(|_| Box::pin(async { Ok(Some("https://github.com/expressjs/express".to_string())) }));
+            .returning(|_| {
+                Box::pin(async { Ok(Some("https://github.com/expressjs/express".to_string())) })
+            });
 
         let db: crate::db::DynDB = Arc::new(mock_db);
 
@@ -692,14 +697,14 @@ mod tests {
             .returning(|_| {
                 Box::pin(async {
                     // DB has a manual override pointing to a different repo
-                    Ok(Some("https://github.com/reactjs/react-monorepo".to_string()))
+                    Ok(Some(
+                        "https://github.com/reactjs/react-monorepo".to_string(),
+                    ))
                 })
             });
 
         // save_component_mapping should NOT be called since DB mapping exists
-        mock_db
-            .expect_save_component_mapping()
-            .times(0);
+        mock_db.expect_save_component_mapping().times(0);
 
         let db: crate::db::DynDB = Arc::new(mock_db);
 
@@ -739,14 +744,10 @@ mod tests {
 
         // Mock DB should NOT be called for get_component_mapping
         let mut mock_db = MockDB::new();
-        mock_db
-            .expect_get_component_mapping()
-            .times(0); // Should not be called without purl
+        mock_db.expect_get_component_mapping().times(0); // Should not be called without purl
 
         // save_component_mapping should also NOT be called (no purl to save)
-        mock_db
-            .expect_save_component_mapping()
-            .times(0);
+        mock_db.expect_save_component_mapping().times(0);
 
         let db: crate::db::DynDB = Arc::new(mock_db);
 
@@ -765,8 +766,8 @@ mod tests {
     #[tokio::test]
     async fn test_lookup_db_error_falls_back_to_auto_discovery() {
         use crate::db::MockDB;
-        use std::sync::Arc;
         use anyhow::format_err;
+        use std::sync::Arc;
 
         // Setup: Component with purl and VCS reference
         let component = DtComponent {
@@ -840,7 +841,9 @@ mod tests {
         // get_component_mapping returns None
         mock_db
             .expect_get_component_mapping()
-            .with(mockall::predicate::eq("pkg:github/microsoft/typescript@5.0.0"))
+            .with(mockall::predicate::eq(
+                "pkg:github/microsoft/typescript@5.0.0",
+            ))
             .times(1)
             .returning(|_| Box::pin(async { Ok(None) }));
 
@@ -1055,7 +1058,10 @@ mod tests {
         let pom_xml = r#"<?xml version="1.0"?>
 <project><scm><url>https://github.com/spring-projects/spring-framework</url></scm></project>"#;
         let maven_server = maven_mock
-            .mock("GET", "/org/springframework/spring-core/5.3.0/spring-core-5.3.0.pom")
+            .mock(
+                "GET",
+                "/org/springframework/spring-core/5.3.0/spring-core-5.3.0.pom",
+            )
             .with_status(200)
             .with_body(pom_xml)
             .create_async()

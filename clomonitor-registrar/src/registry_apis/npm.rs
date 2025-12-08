@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{normalize_git_url, parse_npm_purl, RegistryApi};
+use super::{RegistryApi, normalize_git_url, parse_npm_purl};
 
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 
@@ -114,10 +114,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            result,
-            Some("https://github.com/lodash/lodash".to_string())
-        );
+        assert_eq!(result, Some("https://github.com/lodash/lodash".to_string()));
         mock_server.assert_async().await;
     }
 

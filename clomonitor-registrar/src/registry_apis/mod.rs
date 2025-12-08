@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -177,9 +177,7 @@ pub(crate) fn normalize_git_url(url: &str) -> Option<String> {
     };
 
     // Validate it's a known git hosting service
-    if url.contains("github.com/")
-        || url.contains("gitlab.com/")
-        || url.contains("bitbucket.org/")
+    if url.contains("github.com/") || url.contains("gitlab.com/") || url.contains("bitbucket.org/")
     {
         Some(url)
     } else {
@@ -187,8 +185,8 @@ pub(crate) fn normalize_git_url(url: &str) -> Option<String> {
     }
 }
 
-pub mod npm;
 pub mod maven;
+pub mod npm;
 pub mod pypi;
 
 pub use npm::NpmRegistry;

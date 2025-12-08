@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
-use super::{normalize_git_url, parse_pypi_purl, RegistryApi};
+use super::{RegistryApi, normalize_git_url, parse_pypi_purl};
 
 const PYPI_API_URL: &str = "https://pypi.org/pypi";
 

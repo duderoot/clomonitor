@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::{Context, Error, Result, format_err};
 use config::Config;
@@ -12,7 +15,7 @@ use tracing::{debug, error, info, instrument};
 use crate::db::DynDB;
 use crate::dt_client::{DtClient, DtHttpClient};
 use crate::dt_mapper::{extract_repository_url_with_lookup, should_process_component};
-use crate::registry_apis::{RegistryRouter, NpmRegistry, maven::MavenRegistry, pypi::PyPIRegistry};
+use crate::registry_apis::{NpmRegistry, RegistryRouter, maven::MavenRegistry, pypi::PyPIRegistry};
 
 /// Maximum time that can take processing a foundation data file.
 const FOUNDATION_TIMEOUT: u64 = 300;
@@ -22,6 +25,37 @@ const FOUNDATION_TIMEOUT: u64 = 300;
 pub(crate) struct DtConfig {
     pub dt_url: String,
     pub dt_api_key: String,
+}
+
+/// Configuration for connecting to a clomonitor-importer instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ImporterApiConfig {
+    /// Base URL of the clomonitor-importer service
+    pub importer_url: String,
+
+    /// Default maturity level for projects without maturity
+    #[serde(default)]
+    pub default_maturity: Option<String>,
+
+    /// Mapping from importer maturity values to clomonitor values
+    #[serde(default)]
+    pub maturity_mapping: Option<HashMap<String, String>>,
+
+    /// Default category for projects without category
+    #[serde(default)]
+    pub default_category: Option<String>,
+
+    /// Default check sets for repositories without check_sets
+    #[serde(default)]
+    pub default_check_sets: Option<Vec<String>>,
+
+    /// Page size for pagination (default: 1000)
+    #[serde(default = "default_page_size")]
+    pub page_size: u32,
+}
+
+fn default_page_size() -> u32 {
+    1000
 }
 
 /// Configuration for registry API lookups.
@@ -38,12 +72,13 @@ pub(crate) struct RegistryApiConfig {
     pub pypi_enabled: bool,
 }
 
-/// Data source for a foundation - either a YAML URL or a Dependency-Track instance.
+/// Data source for a foundation - either a YAML URL, Dependency-Track instance, or Importer API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum DataSource {
     YamlUrl { data_url: String },
     DependencyTrack(DtConfig),
+    ImporterApi(ImporterApiConfig),
 }
 
 /// Represents a foundation registered in the database.
@@ -156,7 +191,12 @@ pub(crate) async fn run(cfg: &Config, db: DynDB) -> Result<()> {
             let foundation_id = foundation.foundation_id.clone();
             match timeout(
                 Duration::from_secs(FOUNDATION_TIMEOUT),
-                process_foundation(db.clone(), http_client.clone(), foundation, registry_api_cfg.clone()),
+                process_foundation(
+                    db.clone(),
+                    http_client.clone(),
+                    foundation,
+                    registry_api_cfg.clone(),
+                ),
             )
             .await
             {
@@ -186,7 +226,7 @@ pub(crate) async fn run(cfg: &Config, db: DynDB) -> Result<()> {
     result
 }
 
-/// Process foundation based on its data source type (YAML URL or Dependency-Track).
+/// Process foundation based on its data source type (YAML URL, Dependency-Track, or Importer API).
 #[instrument(fields(foundation = foundation.foundation_id), skip_all, err)]
 async fn process_foundation(
     db: DynDB,
@@ -201,6 +241,7 @@ async fn process_foundation(
         DataSource::DependencyTrack(_) => {
             process_dt_foundation(db, foundation, registry_api_cfg).await
         }
+        DataSource::ImporterApi(_) => process_importer_foundation(db, foundation).await,
     }
 }
 
@@ -590,7 +631,11 @@ async fn process_single_dt_project(
     );
 
     let components = dt_client.get_project_components(&dt_project.uuid).await?;
-    debug!("Found {} components in {}", components.len(), dt_project.name);
+    debug!(
+        "Found {} components in {}",
+        components.len(),
+        dt_project.name
+    );
 
     let mut result = ProcessingResult {
         dt_project_name: dt_project.name.clone(),
@@ -637,7 +682,10 @@ async fn process_single_dt_project(
                         }
                     }
                     Err(e) => {
-                        error!("Failed to build project for component {}: {}", component.name, e);
+                        error!(
+                            "Failed to build project for component {}: {}",
+                            component.name, e
+                        );
                         result.failed_registrations += 1;
                     }
                 }
@@ -649,7 +697,10 @@ async fn process_single_dt_project(
                         result.unmapped_count += 1;
                     }
                     Err(e) => {
-                        error!("Failed to save unmapped component {}: {}", unmapped.component_name, e);
+                        error!(
+                            "Failed to save unmapped component {}: {}",
+                            unmapped.component_name, e
+                        );
                         result.failed_unmapped_saves += 1;
                         // Continue to next component - don't let one failure stop others
                     }
@@ -780,6 +831,163 @@ async fn cleanup_removed_projects(
     }
 
     Ok(())
+}
+
+/// Process foundation's Importer API instance. Fetches all projects from the
+/// importer API, converts them to CLOMonitor projects, and registers them in
+/// the database.
+#[instrument(fields(foundation = foundation.foundation_id), skip_all, err)]
+async fn process_importer_foundation(db: DynDB, foundation: Foundation) -> Result<()> {
+    let start = Instant::now();
+    debug!("started (Importer API)");
+
+    let importer_config = match &foundation.data_source {
+        DataSource::ImporterApi(config) => config,
+        _ => return Err(format_err!("Expected ImporterApi data source")),
+    };
+
+    // Create importer client
+    let importer_client =
+        crate::importer_client::ImporterClient::new(importer_config.importer_url.clone());
+
+    // Fetch all projects from importer API
+    let export_projects = importer_client
+        .get_all_projects(None, importer_config.page_size)
+        .await
+        .context("Failed to fetch projects from importer API")?;
+
+    debug!("Found {} projects to process", export_projects.len());
+
+    // Convert export projects to registrar projects
+    let mut projects_available: HashMap<String, Project> =
+        HashMap::with_capacity(export_projects.len());
+
+    for export_project in export_projects {
+        match convert_export_project(export_project, importer_config) {
+            Ok(mut project) => {
+                project
+                    .set_digest()
+                    .context("Failed to set project digest")?;
+                projects_available.insert(project.name.clone(), project);
+            }
+            Err(e) => {
+                error!("Failed to convert project: {}", e);
+                // Continue processing other projects
+            }
+        }
+    }
+
+    // Get projects registered in the database
+    let foundation_id = &foundation.foundation_id;
+    let projects_registered = db.foundation_projects(foundation_id).await?;
+
+    // Register or update available projects as needed
+    for (name, project) in &projects_available {
+        // Check if the project is already registered
+        if let Some(registered_digest) = projects_registered.get(name) {
+            if registered_digest == &project.digest {
+                continue;
+            }
+        }
+
+        // Register project
+        debug!(project = project.name, "registering");
+        if let Err(err) = db.register_project(foundation_id, project).await {
+            error!(?err, project = project.name, "error registering");
+        }
+    }
+
+    // Unregister projects no longer available in the importer API
+    if !projects_available.is_empty() {
+        for name in projects_registered.keys() {
+            if !projects_available.contains_key(name) {
+                debug!(project = name, "unregistering");
+                if let Err(err) = db.unregister_project(foundation_id, name).await {
+                    error!(?err, project = name, "error unregistering");
+                }
+            }
+        }
+    }
+
+    debug!(duration_secs = start.elapsed().as_secs(), "completed");
+    Ok(())
+}
+
+/// Convert an ExportProject from the importer API to a registrar Project.
+///
+/// This function applies configuration-based transformations:
+/// - Maturity mapping: if config.maturity_mapping contains the project's maturity, use mapped value
+/// - Default maturity: if project has no maturity, use config.default_maturity
+/// - Default category: if project has no category, use config.default_category
+/// - Default check_sets: if repository has no check_sets, use config.default_check_sets
+///
+/// # Returns
+/// - `Ok(Project)` if conversion succeeds
+/// - `Err` if project has no repositories
+fn convert_export_project(
+    export: crate::importer_client::ExportProject,
+    config: &ImporterApiConfig,
+) -> Result<Project> {
+    // Validate project has repositories
+    if export.repositories.is_empty() {
+        return Err(format_err!("Project '{}' has no repositories", export.name));
+    }
+
+    // Apply maturity mapping and defaults
+    let maturity = if let Some(ref current_maturity) = export.maturity {
+        // Check if maturity should be mapped
+        if let Some(ref mapping) = config.maturity_mapping {
+            if let Some(mapped_maturity) = mapping.get(current_maturity) {
+                Some(mapped_maturity.clone())
+            } else {
+                Some(current_maturity.clone())
+            }
+        } else {
+            Some(current_maturity.clone())
+        }
+    } else {
+        // No maturity, use default if available
+        config.default_maturity.clone()
+    };
+
+    // Apply category default
+    let category = export.category.or_else(|| config.default_category.clone());
+
+    // Convert repositories
+    let repositories = export
+        .repositories
+        .into_iter()
+        .map(|export_repo| {
+            let check_sets = export_repo
+                .check_sets
+                .or_else(|| config.default_check_sets.clone());
+
+            Repository {
+                name: export_repo.name,
+                url: export_repo.url,
+                check_sets,
+                exclude: None,
+            }
+        })
+        .collect();
+
+    // Build description - use provided or empty string
+    let description = export.description.unwrap_or_default();
+
+    Ok(Project {
+        name: export.name,
+        display_name: export.display_name,
+        description,
+        category,
+        home_url: None,
+        logo_url: export.logo_url,
+        logo_dark_url: None,
+        devstats_url: export.devstats_url,
+        accepted_at: None,
+        maturity,
+        digest: None,
+        repositories,
+    })
 }
 
 #[cfg(test)]
@@ -1115,6 +1323,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_importer_api_config_deserialization() {
+        let yaml = r#"
+            importer_url: "https://importer.example.com"
+            default_maturity: "sandbox"
+            default_category: "library"
+            page_size: 500
+        "#;
+        let config: ImporterApiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.importer_url, "https://importer.example.com");
+        assert_eq!(config.default_maturity, Some("sandbox".to_string()));
+        assert_eq!(config.default_category, Some("library".to_string()));
+        assert_eq!(config.page_size, 500);
+    }
+
+    #[test]
+    fn test_importer_api_config_defaults() {
+        let yaml = r#"
+            importer_url: "https://importer.example.com"
+        "#;
+        let config: ImporterApiConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.importer_url, "https://importer.example.com");
+        assert_eq!(config.default_maturity, None);
+        assert_eq!(config.default_category, None);
+        assert_eq!(config.maturity_mapping, None);
+        assert_eq!(config.default_check_sets, None);
+        assert_eq!(config.page_size, 1000); // default value
+    }
+
+    #[test]
+    fn test_foundation_importer_api_deserialization() {
+        let json = r#"{
+            "foundation_id": "importer-instance",
+            "importer_url": "https://importer.example.com",
+            "default_maturity": "sandbox",
+            "default_category": "library"
+        }"#;
+        let foundation: Foundation = serde_json::from_str(json).unwrap();
+        assert_eq!(foundation.foundation_id, "importer-instance");
+        assert!(matches!(foundation.data_source, DataSource::ImporterApi(_)));
+        if let DataSource::ImporterApi(importer_config) = foundation.data_source {
+            assert_eq!(importer_config.importer_url, "https://importer.example.com");
+            assert_eq!(
+                importer_config.default_maturity,
+                Some("sandbox".to_string())
+            );
+            assert_eq!(
+                importer_config.default_category,
+                Some("library".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_foundation_importer_api_with_maturity_mapping() {
+        let json = r#"{
+            "foundation_id": "importer-instance",
+            "importer_url": "https://importer.example.com",
+            "maturity_mapping": {
+                "incubating": "sandbox",
+                "graduated": "graduated"
+            },
+            "default_check_sets": ["code", "community"]
+        }"#;
+        let foundation: Foundation = serde_json::from_str(json).unwrap();
+        assert_eq!(foundation.foundation_id, "importer-instance");
+        if let DataSource::ImporterApi(importer_config) = foundation.data_source {
+            assert_eq!(importer_config.importer_url, "https://importer.example.com");
+            assert!(importer_config.maturity_mapping.is_some());
+            let mapping = importer_config.maturity_mapping.unwrap();
+            assert_eq!(mapping.get("incubating"), Some(&"sandbox".to_string()));
+            assert_eq!(mapping.get("graduated"), Some(&"graduated".to_string()));
+            assert_eq!(
+                importer_config.default_check_sets,
+                Some(vec!["code".to_string(), "community".to_string()])
+            );
+        } else {
+            panic!("Expected ImporterApi data source");
+        }
+    }
+
     #[tokio::test]
     async fn test_process_dt_foundation() {
         let mut server = mockito::Server::new_async().await;
@@ -1167,9 +1456,10 @@ mod tests {
             .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
 
         db.expect_register_project()
-            .with(eq("dt-test"), mockall::predicate::function(|p: &Project| {
-                p.name == "npm-lodash-4.17.21"
-            }))
+            .with(
+                eq("dt-test"),
+                mockall::predicate::function(|p: &Project| p.name == "npm-lodash-4.17.21"),
+            )
             .times(1)
             .returning(|_, _| Box::pin(future::ready(Ok(()))));
 
@@ -1420,5 +1710,271 @@ mod tests {
 
         projects_mock.assert_async().await;
         components_mock.assert_async().await;
+    }
+
+    #[test]
+    fn test_convert_export_project_basic() {
+        use crate::importer_client::{ExportProject, ExportRepository};
+
+        let export_project = ExportProject {
+            name: "test-project".to_string(),
+            display_name: Some("Test Project".to_string()),
+            description: Some("A test project".to_string()),
+            category: Some("app".to_string()),
+            maturity: Some("sandbox".to_string()),
+            logo_url: Some("https://example.com/logo.png".to_string()),
+            devstats_url: Some("https://devstats.example.com".to_string()),
+            repositories: vec![ExportRepository {
+                name: "repo1".to_string(),
+                url: "https://github.com/test/repo1".to_string(),
+                check_sets: Some(vec!["code".to_string()]),
+            }],
+        };
+
+        let config = ImporterApiConfig {
+            importer_url: "https://importer.example.com".to_string(),
+            default_maturity: None,
+            maturity_mapping: None,
+            default_category: None,
+            default_check_sets: None,
+            page_size: 1000,
+        };
+
+        let result = convert_export_project(export_project, &config);
+        assert!(result.is_ok());
+
+        let project = result.unwrap();
+        assert_eq!(project.name, "test-project");
+        assert_eq!(project.display_name, Some("Test Project".to_string()));
+        assert_eq!(project.description, "A test project");
+        assert_eq!(project.category, Some("app".to_string()));
+        assert_eq!(project.maturity, Some("sandbox".to_string()));
+        assert_eq!(
+            project.logo_url,
+            Some("https://example.com/logo.png".to_string())
+        );
+        assert_eq!(
+            project.devstats_url,
+            Some("https://devstats.example.com".to_string())
+        );
+        assert_eq!(project.repositories.len(), 1);
+        assert_eq!(project.repositories[0].name, "repo1");
+        assert_eq!(project.repositories[0].url, "https://github.com/test/repo1");
+        assert_eq!(
+            project.repositories[0].check_sets,
+            Some(vec!["code".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_convert_export_project_with_maturity_mapping() {
+        use crate::importer_client::{ExportProject, ExportRepository};
+
+        let export_project = ExportProject {
+            name: "test-project".to_string(),
+            display_name: None,
+            description: Some("Test".to_string()),
+            category: None,
+            maturity: Some("incubating".to_string()),
+            logo_url: None,
+            devstats_url: None,
+            repositories: vec![ExportRepository {
+                name: "repo1".to_string(),
+                url: "https://github.com/test/repo1".to_string(),
+                check_sets: None,
+            }],
+        };
+
+        let mut maturity_mapping = HashMap::new();
+        maturity_mapping.insert("incubating".to_string(), "sandbox".to_string());
+        maturity_mapping.insert("graduated".to_string(), "graduated".to_string());
+
+        let config = ImporterApiConfig {
+            importer_url: "https://importer.example.com".to_string(),
+            default_maturity: None,
+            maturity_mapping: Some(maturity_mapping),
+            default_category: None,
+            default_check_sets: None,
+            page_size: 1000,
+        };
+
+        let result = convert_export_project(export_project, &config);
+        assert!(result.is_ok());
+
+        let project = result.unwrap();
+        // Maturity should be mapped from "incubating" to "sandbox"
+        assert_eq!(project.maturity, Some("sandbox".to_string()));
+    }
+
+    #[test]
+    fn test_convert_export_project_with_defaults() {
+        use crate::importer_client::{ExportProject, ExportRepository};
+
+        let export_project = ExportProject {
+            name: "test-project".to_string(),
+            display_name: None,
+            description: None,
+            category: None,
+            maturity: None,
+            logo_url: None,
+            devstats_url: None,
+            repositories: vec![ExportRepository {
+                name: "repo1".to_string(),
+                url: "https://github.com/test/repo1".to_string(),
+                check_sets: None,
+            }],
+        };
+
+        let config = ImporterApiConfig {
+            importer_url: "https://importer.example.com".to_string(),
+            default_maturity: Some("sandbox".to_string()),
+            maturity_mapping: None,
+            default_category: Some("library".to_string()),
+            default_check_sets: Some(vec!["code".to_string(), "community".to_string()]),
+            page_size: 1000,
+        };
+
+        let result = convert_export_project(export_project, &config);
+        assert!(result.is_ok());
+
+        let project = result.unwrap();
+        // Should use default values
+        assert_eq!(project.maturity, Some("sandbox".to_string()));
+        assert_eq!(project.category, Some("library".to_string()));
+        assert_eq!(project.description, ""); // Should be empty string, not None
+        assert_eq!(
+            project.repositories[0].check_sets,
+            Some(vec!["code".to_string(), "community".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_convert_export_project_no_repositories_fails() {
+        use crate::importer_client::ExportProject;
+
+        let export_project = ExportProject {
+            name: "test-project".to_string(),
+            display_name: None,
+            description: Some("Test".to_string()),
+            category: None,
+            maturity: None,
+            logo_url: None,
+            devstats_url: None,
+            repositories: vec![], // Empty repositories
+        };
+
+        let config = ImporterApiConfig {
+            importer_url: "https://importer.example.com".to_string(),
+            default_maturity: None,
+            maturity_mapping: None,
+            default_category: None,
+            default_check_sets: None,
+            page_size: 1000,
+        };
+
+        let result = convert_export_project(export_project, &config);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Project 'test-project' has no repositories"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_importer_foundation_registers_projects() {
+        let mut server = mockito::Server::new_async().await;
+
+        // Mock the importer API to return 2 projects
+        let projects_response = r#"{
+            "foundation": null,
+            "total": 2,
+            "offset": 0,
+            "limit": 1000,
+            "projects": [
+                {
+                    "name": "project1",
+                    "display_name": "Project One",
+                    "description": "First project",
+                    "category": "app",
+                    "maturity": "sandbox",
+                    "logo_url": "https://example.com/logo1.png",
+                    "devstats_url": "https://devstats.example.com/p1",
+                    "repositories": [
+                        {
+                            "name": "repo1",
+                            "url": "https://github.com/org/repo1",
+                            "checkSets": ["code"]
+                        }
+                    ]
+                },
+                {
+                    "name": "project2",
+                    "display_name": "Project Two",
+                    "description": "Second project",
+                    "category": "library",
+                    "maturity": "incubating",
+                    "logo_url": null,
+                    "devstats_url": null,
+                    "repositories": [
+                        {
+                            "name": "repo2",
+                            "url": "https://github.com/org/repo2",
+                            "checkSets": null
+                        }
+                    ]
+                }
+            ]
+        }"#;
+
+        let projects_mock = server
+            .mock("GET", "/api/export/projects?offset=0&limit=1000")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(projects_response)
+            .create_async()
+            .await;
+
+        let mut db = MockDB::new();
+
+        // Called once to get existing projects
+        db.expect_foundation_projects()
+            .with(eq("importer-test"))
+            .times(1)
+            .returning(|_| Box::pin(future::ready(Ok(HashMap::new()))));
+
+        // Expect both projects to be registered
+        db.expect_register_project()
+            .with(
+                eq("importer-test"),
+                mockall::predicate::function(|p: &Project| p.name == "project1"),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(future::ready(Ok(()))));
+
+        db.expect_register_project()
+            .with(
+                eq("importer-test"),
+                mockall::predicate::function(|p: &Project| p.name == "project2"),
+            )
+            .times(1)
+            .returning(|_, _| Box::pin(future::ready(Ok(()))));
+
+        let foundation = Foundation {
+            foundation_id: "importer-test".to_string(),
+            data_source: DataSource::ImporterApi(ImporterApiConfig {
+                importer_url: server.url(),
+                default_maturity: None,
+                maturity_mapping: None,
+                default_category: None,
+                default_check_sets: Some(vec!["code".to_string(), "community".to_string()]),
+                page_size: 1000,
+            }),
+        };
+
+        process_importer_foundation(Arc::new(db), foundation)
+            .await
+            .unwrap();
+
+        projects_mock.assert_async().await;
     }
 }

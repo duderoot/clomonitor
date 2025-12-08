@@ -1,11 +1,11 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::events::Event;
 use reqwest::Client;
 use tracing::{debug, warn};
 
-use super::{normalize_git_url, parse_maven_purl, RegistryApi};
+use super::{RegistryApi, normalize_git_url, parse_maven_purl};
 
 const MAVEN_CENTRAL_URL: &str = "https://repo1.maven.org/maven2";
 
@@ -41,7 +41,12 @@ impl MavenRegistry {
         )
     }
 
-    async fn fetch_pom(&self, group_id: &str, artifact_id: &str, version: &str) -> Result<Option<String>> {
+    async fn fetch_pom(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        version: &str,
+    ) -> Result<Option<String>> {
         let url = self.build_pom_url(group_id, artifact_id, version);
         debug!("Fetching Maven POM from: {}", url);
 
@@ -163,7 +168,10 @@ impl MavenRegistry {
 
         // Priority 4: <issueManagement><url> as last resort
         // Only if it's a GitHub Issues URL
-        if !issue_url.is_empty() && issue_url.contains("github.com") && issue_url.contains("/issues") {
+        if !issue_url.is_empty()
+            && issue_url.contains("github.com")
+            && issue_url.contains("/issues")
+        {
             let repo_url = issue_url.replace("/issues", "");
             if let Some(normalized) = self.validate_and_normalize(&repo_url) {
                 debug!("Found repository from issue tracker: {}", normalized);
@@ -211,7 +219,10 @@ impl MavenRegistry {
 impl RegistryApi for MavenRegistry {
     async fn lookup_repository(&self, purl: &str) -> Result<Option<String>> {
         let (group_id, artifact_id, version) = parse_maven_purl(purl)?;
-        debug!("Looking up Maven artifact: {}:{}:{}", group_id, artifact_id, version);
+        debug!(
+            "Looking up Maven artifact: {}:{}:{}",
+            group_id, artifact_id, version
+        );
 
         let Some(pom_xml) = self.fetch_pom(&group_id, &artifact_id, &version).await? else {
             return Ok(None);
@@ -235,7 +246,10 @@ mod tests {
     async fn test_maven_lookup_pom_with_scm() {
         let mut _mock = mockito::Server::new_async().await;
         let mock_server = _mock
-            .mock("GET", "/org/springframework/spring-core/5.3.0/spring-core-5.3.0.pom")
+            .mock(
+                "GET",
+                "/org/springframework/spring-core/5.3.0/spring-core-5.3.0.pom",
+            )
             .with_status(200)
             .with_header("content-type", "application/xml")
             .with_body(include_str!("testdata/maven_spring_core.pom"))
@@ -259,7 +273,10 @@ mod tests {
     async fn test_maven_lookup_pom_with_gitlab() {
         let mut _mock = mockito::Server::new_async().await;
         let mock_server = _mock
-            .mock("GET", "/org/gitlab/gitlab-library/2.0.0/gitlab-library-2.0.0.pom")
+            .mock(
+                "GET",
+                "/org/gitlab/gitlab-library/2.0.0/gitlab-library-2.0.0.pom",
+            )
             .with_status(200)
             .with_header("content-type", "application/xml")
             .with_body(include_str!("testdata/maven_gitlab.pom"))
@@ -283,7 +300,10 @@ mod tests {
     async fn test_maven_lookup_pom_no_scm() {
         let mut _mock = mockito::Server::new_async().await;
         let mock_server = _mock
-            .mock("GET", "/com/example/no-scm-artifact/1.0.0/no-scm-artifact-1.0.0.pom")
+            .mock(
+                "GET",
+                "/com/example/no-scm-artifact/1.0.0/no-scm-artifact-1.0.0.pom",
+            )
             .with_status(200)
             .with_header("content-type", "application/xml")
             .with_body(include_str!("testdata/maven_no_scm.pom"))
@@ -323,7 +343,10 @@ mod tests {
     async fn test_maven_purl_with_qualifiers() {
         let mut _mock = mockito::Server::new_async().await;
         let mock_server = _mock
-            .mock("GET", "/org/springframework/spring-core/5.3.0/spring-core-5.3.0.pom")
+            .mock(
+                "GET",
+                "/org/springframework/spring-core/5.3.0/spring-core-5.3.0.pom",
+            )
             .with_status(200)
             .with_header("content-type", "application/xml")
             .with_body(include_str!("testdata/maven_spring_core.pom"))
@@ -375,7 +398,10 @@ mod tests {
 
         let mut _mock = mockito::Server::new_async().await;
         let mock_server = _mock
-            .mock("GET", "/com/github/docker-java/docker-java-api/6.2.0/docker-java-api-6.2.0.pom")
+            .mock(
+                "GET",
+                "/com/github/docker-java/docker-java-api/6.2.0/docker-java-api-6.2.0.pom",
+            )
             .with_status(200)
             .with_body(pom)
             .create_async()
