@@ -111,31 +111,17 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Login to OCI Registry
-        id: login-ocir
-        uses: oracle-actions/login-ocir@v1.3.0
-        with:
-          auth_token: ${{ secrets.OCI_AUTH_TOKEN }}
-      - name: Get clomonitor linter OCIR repository
-        id: get-ocir-repository-linter
-        uses: oracle-actions/get-ocir-repository@v1.3.0
-        with:
-          name: clomonitor/linter
-          compartment: ${{ secrets.OCI_COMPARTMENT_OCID }}
       - name: Build and push image
         env:
-          OCIR_REPOSITORY: ${{ steps.get-ocir-repository-linter.outputs.repo_path }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           docker build \
             -f clomonitor-linter/Dockerfile \
             -t ghcr.io/${{ github.repository }}/linter:latest \
-            -t $OCIR_REPOSITORY:$GITHUB_SHA \
             -t $DOCKERHUB_USERNAME/clomonitor-linter:latest \
             -t $DOCKERHUB_USERNAME/clomonitor-linter:$GITHUB_SHA \
             .
           docker push ghcr.io/${{ github.repository }}/linter:latest
-          docker push $OCIR_REPOSITORY:$GITHUB_SHA
           docker push $DOCKERHUB_USERNAME/clomonitor-linter:latest
           docker push $DOCKERHUB_USERNAME/clomonitor-linter:$GITHUB_SHA
 
