@@ -106,6 +106,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to OCI Registry
         id: login-ocir
         uses: oracle-actions/login-ocir@v1.3.0
@@ -120,14 +125,19 @@ jobs:
       - name: Build and push image
         env:
           OCIR_REPOSITORY: ${{ steps.get-ocir-repository-linter.outputs.repo_path }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           docker build \
             -f clomonitor-linter/Dockerfile \
             -t ghcr.io/${{ github.repository }}/linter:latest \
             -t $OCIR_REPOSITORY:$GITHUB_SHA \
+            -t $DOCKERHUB_USERNAME/clomonitor-linter:latest \
+            -t $DOCKERHUB_USERNAME/clomonitor-linter:$GITHUB_SHA \
             .
           docker push ghcr.io/${{ github.repository }}/linter:latest
           docker push $OCIR_REPOSITORY:$GITHUB_SHA
+          docker push $DOCKERHUB_USERNAME/clomonitor-linter:latest
+          docker push $DOCKERHUB_USERNAME/clomonitor-linter:$GITHUB_SHA
 
   build-notifier-image:
     if: github.ref == 'refs/heads/main'
